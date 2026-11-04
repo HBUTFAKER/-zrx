@@ -1,0 +1,7 @@
+pandas
+numpy
+baostock
+akshare
+streamlit
+pytest
+pyarrow

@@ -1,0 +1,18 @@
+# 数据与输出（原始数据只增不改，不进版本库）
+data/
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python311/
+*.egg-info/
+.pytest_cache/
+
+# IDE / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
