@@ -1,6 +1,8 @@
 # 数据与输出（原始数据只增不改，不进版本库）
-data/
+data/*
 out/
+# 例外：字段字典是文档不是数据，必须进版本库
+!data/dict.md
 
 # Python
 __pycache__/
