@@ -74,7 +74,7 @@ FIELD_DICT = [
     ("daily", "fetch_date", "抓取日期", "YYYY-MM-DD", "该行原始数据的抓取日，用于溯源", "本层写入"),
 
     ("finance", "code", "股票代码", "-", "带交易所前缀", "baostock 季频接口"),
-    ("finance", "pubDate", "公告日期", "YYYY-MM-DD", "**财报实际公告日，防未来函数只能用这个**", "query_profit_data.pubDate"),
+    ("finance", "pubDate", "实际披露日", "YYYY-MM-DD", "**防未来函数只能用这个**。东财源取「实际披露」（stock_report_disclosure），baostock 源取原始 pubDate；缺失保留 NaN，绝不回退到东财「公告日期」（后者是最新修正公告日，会把 2018 年报标成 2024 年）", "stock_report_disclosure.实际披露 / query_profit_data.pubDate"),
     ("finance", "statDate", "报告期截止日", "YYYY-MM-DD", "财报报告期（如 2023-06-30），不可用于对齐", "同上"),
     ("finance", "year", "报告年度", "年", "由 statDate 截取", "本层计算"),
     ("finance", "quarter", "报告季度", "1-4", "抓取时使用的季度参数", "本层写入"),
@@ -102,7 +102,17 @@ FIELD_DICT = [
     ("finance", "CFOToGr", "经营现金流/营业总收入", "倍", "同上口径（增长率分母）", "query_cash_flow_data.CFOToGr"),
     ("finance", "CAToAsset", "流动资产/总资产", "倍", "结构指标", "query_cash_flow_data.CAToAsset"),
     ("finance", "NCAToAsset", "非流动资产/总资产", "倍", "结构指标", "query_cash_flow_data.NCAToAsset"),
-    ("finance", "cfo_est", "经营现金流（推算）", "元", "**推算列**：MBRevenue × CFOToOR，不是原始披露值；查不到比率则为 NaN", "本层推算，勿直接引用为财报原值"),
+    ("finance", "cfo_est", "经营现金流", "元", "东财源为真实披露绝对值；baostock 源为推算（MBRevenue × CFOToOR），查不到比率则 NaN", "ocf_abs / 推算"),
+    ("finance", "ocf_abs", "经营现金流量净额", "元", "**仅东财源有**，真实披露值，非推算", "stock_xjll_em.经营性现金流-现金流量净额"),
+    ("finance", "total_equity", "股东权益合计", "元", "**仅东财源有**，用于推算 ROE", "stock_zcfz_em.股东权益合计"),
+    ("finance", "total_asset", "资产总计", "元", "**仅东财源有**", "stock_zcfz_em.资产-总资产"),
+    ("finance", "debt_ratio", "资产负债率", "%", "**仅东财源有**", "stock_zcfz_em.资产负债率"),
+    ("finance", "roeAvg_derived", "净资产收益率（推算）", "%", "**推算列**：netProfit / total_equity × 100，报告期累计口径，未年化", "本层推算"),
+    ("finance", "npMargin_derived", "净利率（推算）", "%", "**推算列**：netProfit / MBRevenue × 100", "本层推算"),
+    ("finance", "gpMargin_derived", "毛利率（推算）", "%", "**推算列**：(MBRevenue − 营业支出) / MBRevenue × 100", "本层推算"),
+    ("finance", "CFOToOR_derived", "经营现金流/营收（推算）", "%", "**推算列**：ocf_abs / MBRevenue × 100", "本层推算"),
+    ("finance", "CFOToNP_derived", "经营现金流/净利润（推算）", "%", "**推算列**：ocf_abs / netProfit × 100", "本层推算"),
+    ("finance", "source", "数据来源", "-", "akshare_em = 东财三表（全市场，不含退市股）；baostock = 退市股补抓", "本层标注"),
     ("finance", "fetch_date", "抓取日期", "YYYY-MM-DD", "溯源用", "本层写入"),
 
     ("pool_daily", "date", "交易日期", "YYYY-MM-DD", "交易日", "由 daily 派生"),
@@ -308,14 +318,29 @@ def clean(years: list[int]) -> dict:
     fin = _latest(sorted(RAW_FIN.glob("finance_*.parquet")), key=("code", "statDate"))
     if fin is not None:
         fin = fin.copy()
-        # 经营现金流绝对值不是披露字段，只能由 收入 × 比率 推算 → 显式标注为推算列
-        fin["cfo_est"] = fin["MBRevenue"] * fin["CFOToOR"]
+        # 两个源并存，口径不同，必须归一：
+        #   东财（source=akshare_em）：全市场一次拉取，绝对值齐全，ROE/毛利率是推算列
+        #   baostock：只用于补东财剔除的退市股，ROE/毛利率是披露原值，经营现金流只有比率
+        # 归一原则：标准列名优先，缺失时用另一源的对应列补，仍缺失就保留 NaN（不插补）
+        for std, der in (("roeAvg", "roeAvg_derived"), ("gpMargin", "gpMargin_derived"),
+                         ("npMargin", "npMargin_derived"), ("CFOToOR", "CFOToOR_derived")):
+            if der in fin.columns:
+                fin[std] = fin[std].fillna(fin[der]) if std in fin.columns else fin[der]
+        # 经营现金流绝对值：东财直接给 ocf_abs；baostock 只有 CFOToOR 比率 → 营收 × 比率 推算
+        cfo = pd.Series(np.nan, index=fin.index)
+        if "ocf_abs" in fin.columns:
+            cfo = fin["ocf_abs"].astype(float)
+        if "CFOToOR" in fin.columns:
+            cfo = cfo.fillna(fin["MBRevenue"] * fin["CFOToOR"])
+        fin["cfo_est"] = cfo
         fin = fin.drop(columns=[c for c in ("year",) if c in fin.columns])
         fin["year"] = fin["statDate"].str.slice(0, 4).astype("int16")
         fin = fin.sort_values(["code", "statDate"])
         fin.to_parquet(CACHE / "finance.parquet", index=False)
         stats["finance"] = len(fin)
+        n_ak = int((fin["source"] == "akshare_em").sum()) if "source" in fin.columns else 0
         print(f"[clean] finance: {len(fin)} 行, {fin['code'].nunique()} 只, "
+              f"东财 {n_ak} 行 / baostock 补 {len(fin) - n_ak} 行, "
               f"pubDate 缺失 {int(fin['pubDate'].isna().sum())} 行")
 
     # ---------- manifest

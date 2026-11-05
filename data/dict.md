@@ -39,7 +39,7 @@
 | 字段 | 中文名 | 单位 | 口径 | 来源 |
 |---|---|---|---|---|
 | `code` | 股票代码 | - | 带交易所前缀 | baostock 季频接口 |
-| `pubDate` | 公告日期 | YYYY-MM-DD | **财报实际公告日，防未来函数只能用这个** | query_profit_data.pubDate |
+| `pubDate` | 实际披露日 | YYYY-MM-DD | **防未来函数只能用这个**。东财源取「实际披露」（stock_report_disclosure），baostock 源取原始 pubDate；缺失保留 NaN，绝不回退到东财「公告日期」（后者是最新修正公告日，会把 2018 年报标成 2024 年） | stock_report_disclosure.实际披露 / query_profit_data.pubDate |
 | `statDate` | 报告期截止日 | YYYY-MM-DD | 财报报告期（如 2023-06-30），不可用于对齐 | 同上 |
 | `year` | 报告年度 | 年 | 由 statDate 截取 | 本层计算 |
 | `quarter` | 报告季度 | 1-4 | 抓取时使用的季度参数 | 本层写入 |
@@ -67,7 +67,17 @@
 | `CFOToGr` | 经营现金流/营业总收入 | 倍 | 同上口径（增长率分母） | query_cash_flow_data.CFOToGr |
 | `CAToAsset` | 流动资产/总资产 | 倍 | 结构指标 | query_cash_flow_data.CAToAsset |
 | `NCAToAsset` | 非流动资产/总资产 | 倍 | 结构指标 | query_cash_flow_data.NCAToAsset |
-| `cfo_est` | 经营现金流（推算） | 元 | **推算列**：MBRevenue × CFOToOR，不是原始披露值；查不到比率则为 NaN | 本层推算，勿直接引用为财报原值 |
+| `cfo_est` | 经营现金流 | 元 | 东财源为真实披露绝对值；baostock 源为推算（MBRevenue × CFOToOR），查不到比率则 NaN | ocf_abs / 推算 |
+| `ocf_abs` | 经营现金流量净额 | 元 | **仅东财源有**，真实披露值，非推算 | stock_xjll_em.经营性现金流-现金流量净额 |
+| `total_equity` | 股东权益合计 | 元 | **仅东财源有**，用于推算 ROE | stock_zcfz_em.股东权益合计 |
+| `total_asset` | 资产总计 | 元 | **仅东财源有** | stock_zcfz_em.资产-总资产 |
+| `debt_ratio` | 资产负债率 | % | **仅东财源有** | stock_zcfz_em.资产负债率 |
+| `roeAvg_derived` | 净资产收益率（推算） | % | **推算列**：netProfit / total_equity × 100，报告期累计口径，未年化 | 本层推算 |
+| `npMargin_derived` | 净利率（推算） | % | **推算列**：netProfit / MBRevenue × 100 | 本层推算 |
+| `gpMargin_derived` | 毛利率（推算） | % | **推算列**：(MBRevenue − 营业支出) / MBRevenue × 100 | 本层推算 |
+| `CFOToOR_derived` | 经营现金流/营收（推算） | % | **推算列**：ocf_abs / MBRevenue × 100 | 本层推算 |
+| `CFOToNP_derived` | 经营现金流/净利润（推算） | % | **推算列**：ocf_abs / netProfit × 100 | 本层推算 |
+| `source` | 数据来源 | - | akshare_em = 东财三表（全市场，不含退市股）；baostock = 退市股补抓 | 本层标注 |
 | `fetch_date` | 抓取日期 | YYYY-MM-DD | 溯源用 | 本层写入 |
 
 ## pool_daily

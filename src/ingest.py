@@ -421,7 +421,7 @@ def _merge_daily_parts(years: list[int], tag: str) -> None:
 # ---------------------------------------------------------------- 财务
 def _finance_chunk(job: tuple) -> dict:
     """子进程任务：一批代码 × 年 × 季 × 接口。pubDate 与 statDate 必须都在。"""
-    idx, codes, years, interfaces, tag = job
+    idx, codes, years, interfaces, tag, req_interval = job
     try:
         bs = _login()
     except BannedError as e:
@@ -439,6 +439,11 @@ def _finance_chunk(job: tuple) -> dict:
                     fn_name, cols = FIN_INTERFACES[nm]
                     f, r = _query_with_retry(bs, getattr(bs, fn_name),
                                              code=c, year=y, quarter=q, retries=2)
+                    # 实测 baostock 封的是「请求频率」不是连接数：
+                    # workers=1 + 5.5 次/秒，25 分钟（约 8000 次）即被拉黑。
+                    # 补抓退市股这类长任务必须显式限速。
+                    if req_interval:
+                        time.sleep(req_interval)
                     if not r:
                         continue
                     got = True
@@ -472,7 +477,7 @@ def _finance_chunk(job: tuple) -> dict:
 
 def ingest_finance(years: list[int], workers: int = 3, chunk: int = 150,
                    interfaces: list[str] | None = None, limit: int | None = None,
-                   codes: list[str] | None = None) -> None:
+                   codes: list[str] | None = None, req_interval: float = 0.0) -> None:
     interfaces = interfaces or list(FIN_INTERFACES)
     stocks = _load_stocks()
     codes = codes or stocks["code"].tolist()
@@ -481,7 +486,7 @@ def ingest_finance(years: list[int], workers: int = 3, chunk: int = 150,
     tag = _tag(years, limit, codes)
     st_path = _state_path("finance", years, tag)
     st = _load_state(st_path)
-    jobs = [(i, codes[i:i + chunk], years, tuple(interfaces), tag)
+    jobs = [(i, codes[i:i + chunk], years, tuple(interfaces), tag, req_interval)
             for i in range(0, len(codes), chunk)]
     jobs = [j for j in jobs if j[0] not in st["done_chunks"]]
     print(f"[finance] {len(codes)} 只 × {years[0]}~{years[-1]} × {interfaces}，"
@@ -546,6 +551,22 @@ def _merge_finance_parts(years: list[int], tag: str) -> None:
 
 
 # ---------------------------------------------------------------- 清单
+def _load_delisted_codes(since: str = "2018-01-01") -> list[str]:
+    """只取 since 之后退市的股票。
+
+    东财（akshare）的财报接口只保留当前仍在上市的公司：2018 年一季报里
+    250 只「2018 年后退市」的股票只剩 19 只。要让财务表能用于回测，
+    这批退市股必须回 baostock 逐只补，否则就是生存偏差。
+    """
+    f = RAW / "delisted.csv"
+    if not f.exists():
+        raise SystemExit("缺少 data/raw/delisted.csv，先跑: python -m src.ingest --stage meta")
+    dl = pd.read_csv(f, dtype=str)
+    dl = dl[pd.to_datetime(dl["delist_date"], errors="coerce") >= since]
+    pre = dl["exchange"].str.upper().map({"SH": "sh.", "SZ": "sz.", "BJ": "bj."}).fillna("sz.")
+    return sorted((pre + dl["code"].str.zfill(6)).tolist())
+
+
 def _load_stocks() -> pd.DataFrame:
     files = sorted(RAW_META.glob("stocks_*.parquet"))
     if not files:
@@ -568,6 +589,11 @@ def main(argv: list[str] | None = None) -> int:
                     help="只跑指定代码，逗号分隔，如 sh.600519,sz.300750（调试用）")
     ap.add_argument("--interfaces", default=",".join(FIN_INTERFACES),
                     help="profit,growth,operation,cashflow 的子集")
+    ap.add_argument("--req-interval", type=float, default=0.0, dest="req_interval",
+                    help="财务接口每次查询后的间隔秒数。baostock 按请求频率封 IP，"
+                         "补抓退市股这类长任务建议 1.0")
+    ap.add_argument("--delisted-only", action="store_true", dest="delisted_only",
+                    help="只跑 2018 年后退市的股票（东财财报已剔除它们，用于补生存偏差）")
     args = ap.parse_args(argv)
 
     socket.setdefaulttimeout(120)
@@ -590,13 +616,18 @@ def _run_stages(args, years: list[int]) -> None:
     if args.stage in ("all", "meta"):
         ingest_meta()
     only = [c.strip() for c in args.codes.split(",")] if args.codes else None
+    if getattr(args, "delisted_only", False):
+        only = _load_delisted_codes()
+        print(f"[finance] 退市股专用通道：{len(only)} 只（东财财报不含，补生存偏差）")
+        args.stage = "finance"
     if args.stage in ("all", "daily"):
         ingest_daily(years, workers=args.workers,
                      chunk=args.chunk or 120, limit=args.limit, codes=only)
     if args.stage in ("all", "finance"):
         ifs = [s.strip() for s in args.interfaces.split(",") if s.strip()]
         ingest_finance(years, workers=args.workers, chunk=args.chunk or 150,
-                       interfaces=ifs, limit=args.limit, codes=only)
+                       interfaces=ifs, limit=args.limit, codes=only,
+                       req_interval=getattr(args, "req_interval", 0.0))
 
 
 if __name__ == "__main__":
