@@ -193,7 +193,15 @@ def clean(years: list[int]) -> dict:
 
     con = _db()
 
-    pool_rows: list[pd.DataFrame] = []
+    # 股票池按年入库，不把 7 年堆在内存（全量约 900 万行，concat 会吃掉近 1GB）
+    pool_total = 0
+    con.execute("DROP TABLE IF EXISTS pool_daily")
+    # 不带 PRIMARY KEY：全量重建时维护 PK 隐式索引会明显拖慢插入，
+    # 唯一性留给最后的 UNIQUE INDEX 一次性保证（同时充当查询索引）。
+    con.execute("""CREATE TABLE pool_daily(
+        date TEXT, code TEXT, is_st INTEGER, suspended INTEGER, new_stock INTEGER,
+        delisted INTEGER, listed_days INTEGER, tradable INTEGER)""")
+    con.commit()
     total_daily = 0
 
     for y in years:
@@ -248,29 +256,27 @@ def clean(years: list[int]) -> dict:
         print(f"[clean] daily {y}: {len(out)} 行, {out['code'].nunique()} 只")
         stats[f"daily_{y}"] = len(out)
 
-        # ---- 股票池快照
+        # ---- 股票池快照：按年直接入库，内存里只留当年
         p = out[["date", "code", "isST", "suspended", "new_stock", "is_delisted",
                  "listed_days"]].copy()
         p["is_st"] = p["isST"].fillna(-1).astype("int8")
         p["delisted"] = p["is_delisted"].astype("int8")
         p["tradable"] = (p["suspended"] == 0).astype("int8")
-        pool_rows.append(p[["date", "code", "is_st", "suspended", "new_stock",
-                            "delisted", "listed_days", "tradable"]])
-
-    # ---------- 写 SQLite
-    if pool_rows:
-        pool = pd.concat(pool_rows, ignore_index=True)
-        con.execute("DROP TABLE IF EXISTS pool_daily")
-        con.execute("""CREATE TABLE pool_daily(
-            date TEXT, code TEXT, is_st INTEGER, suspended INTEGER, new_stock INTEGER,
-            delisted INTEGER, listed_days INTEGER, tradable INTEGER,
-            PRIMARY KEY(date, code))""")
-        # executemany 而非 to_sql：SQLite 有 32766 个绑定变量上限，且整行插入更快
+        p = p[["date", "code", "is_st", "suspended", "new_stock",
+               "delisted", "listed_days", "tradable"]]
+        # executemany 而非 to_sql：SQLite 有 32766 个绑定变量上限
         con.executemany(
-            "INSERT OR REPLACE INTO pool_daily VALUES (?,?,?,?,?,?,?,?)",
-            pool.itertuples(index=False, name=None))
-        con.execute("CREATE INDEX idx_pool_code_date ON pool_daily(code, date)")
-        stats["pool_daily"] = len(pool)
+            "INSERT INTO pool_daily VALUES (?,?,?,?,?,?,?,?)",
+            p.itertuples(index=False, name=None))
+        con.commit()  # 每年提交一次，限制事务日志规模
+        pool_total += len(p)
+        print(f"[clean] pool_daily {y}: +{len(p)} 行（累计 {pool_total}）")
+
+    # ---------- 股票池索引：插完再建，比边插边维护快一个量级
+    if pool_total:
+        con.execute("CREATE UNIQUE INDEX idx_pool_code_date ON pool_daily(code, date)")
+        con.commit()
+        stats["pool_daily"] = pool_total
 
     # stocks（附数据完整度）
     comp = []
