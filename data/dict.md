@@ -39,15 +39,15 @@
 | 字段 | 中文名 | 单位 | 口径 | 来源 |
 |---|---|---|---|---|
 | `code` | 股票代码 | - | 带交易所前缀 | baostock 季频接口 |
-| `pubDate` | 实际披露日 | YYYY-MM-DD | **防未来函数只能用这个**。东财源取「实际披露」（stock_report_disclosure），baostock 源取原始 pubDate；缺失保留 NaN，绝不回退到东财「公告日期」（后者是最新修正公告日，会把 2018 年报标成 2024 年） | stock_report_disclosure.实际披露 / query_profit_data.pubDate |
+| `pubDate` | 实际披露日 | YYYY-MM-DD | **防未来函数只能用这个**。东财源取「实际披露」（stock_report_disclosure），巨潮源取公告原文列表的首次披露日，baostock 源取原始 pubDate；缺失保留 NaN，绝不回退到东财/新浪的「公告日期」（那是最新修正公告日，实测会把 2018 一季报标成 2019-04-27） | stock_report_disclosure.实际披露 / cninfo 公告列表 / query_profit_data.pubDate |
 | `statDate` | 报告期截止日 | YYYY-MM-DD | 财报报告期（如 2023-06-30），不可用于对齐 | 同上 |
 | `year` | 报告年度 | 年 | 由 statDate 截取 | 本层计算 |
 | `quarter` | 报告季度 | 1-4 | 抓取时使用的季度参数 | 本层写入 |
 | `MBRevenue` | 营业总收入 | 元 | 本期累计主营营业收入 | query_profit_data.MBRevenue |
 | `netProfit` | 净利润 | 元 | 本期累计净利润（含少数股东） | query_profit_data.netProfit |
-| `roeAvg` | 净资产收益率 | % | 区间平均 ROE，baostock 原值（小数） | query_profit_data.roeAvg |
-| `gpMargin` | 毛利率 | % | 毛利/营业收入，baostock 原值（小数） | query_profit_data.gpMargin |
-| `npMargin` | 净利率 | % | 净利/营业收入，baostock 原值（小数） | query_profit_data.npMargin |
+| `roeAvg` | 净资产收益率 | % | 区间平均 ROE，**已统一为百分数**：baostock 原值是小数(0.184=18.4%)，入层时已 ×100；东财/新浪本就是百分数 | query_profit_data.roeAvg×100 / 新浪「净资产收益率_平均」 |
+| `gpMargin` | 毛利率 | % | 毛利/营业收入，**已统一为百分数**（同 roeAvg 处理） | query_profit_data.gpMargin×100 / 新浪「毛利率」 |
+| `npMargin` | 净利率 | % | 净利/营业收入，**已统一为百分数**（同 roeAvg 处理） | query_profit_data.npMargin×100 / 本层推算 |
 | `epsTTM` | 每股收益 TTM | 元/股 | 滚动 12 个月每股收益 | query_profit_data.epsTTM |
 | `totalShare` | 总股本 | 股 | 报告期末总股本 | query_profit_data.totalShare |
 | `liqaShare` | 流通股本 | 股 | 报告期末流通股本 | query_profit_data.liqaShare |
@@ -68,7 +68,7 @@
 | `CAToAsset` | 流动资产/总资产 | 倍 | 结构指标 | query_cash_flow_data.CAToAsset |
 | `NCAToAsset` | 非流动资产/总资产 | 倍 | 结构指标 | query_cash_flow_data.NCAToAsset |
 | `cfo_est` | 经营现金流 | 元 | 东财源为真实披露绝对值；baostock 源为推算（MBRevenue × CFOToOR），查不到比率则 NaN | ocf_abs / 推算 |
-| `ocf_abs` | 经营现金流量净额 | 元 | **仅东财源有**，真实披露值，非推算 | stock_xjll_em.经营性现金流-现金流量净额 |
+| `ocf_abs` | 经营现金流量净额 | 元 | 真实披露绝对值，非推算。东财源与「巨潮+新浪」源都有；baostock 源没有此字段（只有比率 CFOToOR） | stock_xjll_em / 新浪「经营现金流量净额」 |
 | `total_equity` | 股东权益合计 | 元 | **仅东财源有**，用于推算 ROE | stock_zcfz_em.股东权益合计 |
 | `total_asset` | 资产总计 | 元 | **仅东财源有** | stock_zcfz_em.资产-总资产 |
 | `debt_ratio` | 资产负债率 | % | **仅东财源有** | stock_zcfz_em.资产负债率 |
@@ -77,7 +77,7 @@
 | `gpMargin_derived` | 毛利率（推算） | % | **推算列**：(MBRevenue − 营业支出) / MBRevenue × 100 | 本层推算 |
 | `CFOToOR_derived` | 经营现金流/营收（推算） | % | **推算列**：ocf_abs / MBRevenue × 100 | 本层推算 |
 | `CFOToNP_derived` | 经营现金流/净利润（推算） | % | **推算列**：ocf_abs / netProfit × 100 | 本层推算 |
-| `source` | 数据来源 | - | akshare_em = 东财三表（全市场，不含退市股）；baostock = 退市股补抓 | 本层标注 |
+| `source` | 数据来源 | - | akshare_em = 东财三表（全市场，剔除退市股）；cninfo+sina = 巨潮公告日 + 新浪数值（补退市股，字段完整）；baostock = 退市股兜底（MBRevenue 缺失率 55%，仅在前两者覆盖不到的期次生效） | 本层标注 |
 | `fetch_date` | 抓取日期 | YYYY-MM-DD | 溯源用 | 本层写入 |
 
 ## pool_daily

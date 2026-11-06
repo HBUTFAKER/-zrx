@@ -469,6 +469,12 @@ def _finance_chunk(job: tuple) -> dict:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df["pubDate"] = pd.to_datetime(df["pubDate"], errors="coerce").dt.strftime("%Y-%m-%d")
     df["statDate"] = pd.to_datetime(df["statDate"], errors="coerce").dt.strftime("%Y-%m-%d")
+    # baostock 的 ROE/毛利率/净利率是小数（0.184 = 18.4%），东财与新浪给的是百分数（18.4）。
+    # 三个源要并到一张表里，必须统一成百分数，否则 S3 的因子计算会差 100 倍。
+    for c in ("roeAvg", "gpMargin", "npMargin"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce") * 100
+    df["source"] = "baostock"
     df["fetch_date"] = TODAY
     p = RAW_TMP / f"fin_{tag}_{idx}.parquet"
     df.to_parquet(p, index=False)

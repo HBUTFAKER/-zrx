@@ -138,11 +138,28 @@ def test_finance_has_both_dates(finance: pd.DataFrame):
     assert len(ok) > len(finance) * 0.75
 
 
+def test_finance_units_are_percent(finance: pd.DataFrame):
+    """比率类字段必须统一成百分数。
+
+    踩过的坑：baostock 的 roeAvg/gpMargin 是小数（0.184 = 18.4%），
+    东财和新浪给的是百分数（18.4）。三个源并表时若不做归一，
+    同一列里会同时存在 0.18 和 18 两种量级，S3 的因子排序直接失效。
+    """
+    d = finance.dropna(subset=["gpMargin"])
+    assert len(d) > 0, "gpMargin 全为空"
+    med = float(d.groupby("source")["gpMargin"].median().min())
+    assert med > 1, f"有来源的 gpMargin 中位数为 {med}，像是小数口径（应 ×100）"
+    # 单条记录的极端值允许存在（资不抵债的公司 ROE 会到 -10000%），但中位数必须落在合理区间
+    assert -100 < float(d["gpMargin"].median()) < 100
+
+
 def test_finance_covers_delisted(finance: pd.DataFrame):
     """生存偏差硬断言：2018 年后退市的股票必须在财务表里有记录。
 
     东财财报接口只保留仍在上市的公司（2018 一季报里，250 只 2018 后退市股只剩 19 只），
-    这批必须由 baostock 通道补回。未补齐时 skip 并给出补齐命令，补齐后本测试自动生效。
+    这批必须由退市股通道补回。现行做法：
+        src/fill_delisted_cninfo.py —— 巨潮公告列表取真实首次披露日 + 新浪取财务数值。
+    没补时 skip 并给出补齐命令，补齐后本测试自动生效。
     """
     f = RAW / "delisted.csv"
     if not f.exists():
@@ -155,7 +172,7 @@ def test_finance_covers_delisted(finance: pd.DataFrame):
     if len(covered) < len(need) * 0.95:
         pytest.skip(
             f"退市股财务未补齐（{len(covered)}/{len(need)}）。补齐命令："
-            f"python -m src.ingest --stage finance --delisted-only --req-interval 1 --years 2018 2022")
+            f"python -m src.fill_delisted_cninfo --all-delisted")
     assert len(covered) >= len(need) * 0.95
 
 

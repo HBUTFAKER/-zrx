@@ -67,10 +67,14 @@ python -m src.ingest --stage meta
 # 2) 全 A 日线（按年分 parquet）+ 复权因子
 python -m src.ingest --stage daily --years 2018 2024
 
-# 3) 季频财务（营收/净利/ROE/毛利率/经营现金流 + pubDate/statDate）
-python -m src.ingest --stage finance --years 2018 2024
+# 3) 季频财务主体：东财全市场三表（20 个报告期约 7 分钟）
+python -m src.ingest_ak_fin --from-year 2018 --to-year 2022
 
-# 4) 清洗入 cache.db + 生成字段字典
+# 4) 退市股财务补齐：巨潮取首次披露日 + 新浪取数值（246 只约 23 分钟）
+#    东财把退市股从历史报告期里剔除了，不补就是生存偏差
+python -m src.fill_delisted_cninfo --all-delisted
+
+# 5) 清洗入 cache.db + 生成字段字典
 python -m src.clean --years 2018 2024
 
 # 测试
@@ -82,23 +86,35 @@ pytest
 | 位置 | 内容 |
 |---|---|
 | `data/raw/daily/daily_{年}_{抓取日}.parquet` | 日线原始价（不复权）+ isST/tradestatus 等原始字段 |
-| `data/raw/finance/finance_{年}_{抓取日}.parquet` | 季频财务，含 `pubDate` / `statDate` |
+| `data/raw/finance/finance_ak_{年段}_{抓取日}.parquet` | 财务主体：东财全市场三表（在市公司） |
+| `data/raw/finance/finance_cninfo_delisted_{年段}_{抓取日}.parquet` | 财务补充：退市股（巨潮公告日 + 新浪数值） |
+| `data/raw/finance/finance_bs_delisted_{年段}_{抓取日}.parquet` | 财务兜底：baostock 退市股（仅在前两者覆盖不到的期次生效） |
 | `data/raw/meta/` | 股票清单、复权因子、行业分类 |
 | `data/raw/delisted.csv` | 退市清单（akshare 沪深 + baostock 补全） |
 | `data/cache/daily_{年}.parquet` | 清洗宽表：新增 `hfq_*`、`suspended`、`new_stock`、`listed_days` |
-| `data/cache/finance.parquet` | 财务宽表（含推算列 `cfo_est`，已标注） |
+| `data/cache/finance.parquet` | 财务宽表（含推算列 `cfo_est`，已标注；`source` 列标来源） |
 | `data/cache.db` | SQLite：`pool_daily` / `stocks` / `delisted` / `industry` / `manifest` |
-| `data/dict.md` | 字段字典（由 `src/clean.py` 生成，78 个字段，与代码同源） |
+| `data/dict.md` | 字段字典（由 `src/clean.py` 生成，88 个字段，与代码同源） |
 
 ### 几个必须知道的坑
 
-1. **baostock 有并发上限。** 并发开到 8 会被 IP 级拉黑（错误码 `10001011 黑名单用户`），
-   换账号无效，只能降并发等解封。默认 `--workers 3`，实测安全。
+1. **baostock 封的是「请求频率」，不是连接数。** 日线 0.3 次/秒跑 5 小时没事；
+   财务 5.5 次/秒跑 25 分钟（约 8000 次）就被 IP 级拉黑（`10001011 黑名单用户`），
+   换账号无效。默认 `--workers 3`；涉及退市股这类长时间逐只查询时必须显式
+   `--req-interval 1.2` 限速。实测一次封禁最长超过 13 小时。
 2. **baostock 会静默截断。** 偶发"只返回前几百行但 error_code=0"。代码里对所有
    全量接口加了最小行数校验，行数不足即重试，避免残缺数据落盘。
 3. **后复权算法与官方对拍过。** `close × backAdjustFactor`（按除权日 backward 取值）
    与 baostock 官方后复权价在 519/300750/000005 上偏差 0.0000%。
-4. **财务只能用 pubDate 对齐。** `akshare` 的业绩报表接口里"最新公告日期"是**后来更新的**，
-   不是原始公告日，会污染防未来函数，所以财务一律走 baostock 季频接口。
-5. **增量 = 新抓取日新增文件**，历史版本永不覆盖。同一天断点续跑时按主键并集补全。
+4. **「公告日期」这个字段，只有两个地方能用。** 东财财报接口和 新浪财务接口里的
+   「公告日期」都是**最新修订日**——实测 sz.300356 的 2018 一季报被标成 2019-04-27
+   （滞后 392 天），拿它做时点对齐等于提前一年看到数据。真值有两个来源：
+   东财 `stock_report_disclosure` 的「实际披露」（只覆盖在市公司）、
+   巨潮公告原文列表的首条披露日（覆盖退市股）。两者都不适用时留 NaN，绝不估算。
+5. **比率字段统一百分数。** baostock 的 `roeAvg/gpMargin/npMargin` 是小数（0.184），
+   东财和新浪是百分数（18.4）。三个源并表时已在入层 ×100 归一，
+   `test_finance_units_are_percent` 守着这条线。
+6. **东财财报剔除退市股。** 2018 一季报里 250 只 2018 年后退市股只剩 19 只，
+   直接用就是生存偏差。必须跑 `fill_delisted_cninfo --all-delisted` 补齐。
+7. **增量 = 新抓取日新增文件**，历史版本永不覆盖。同一天断点续跑时按主键并集补全。
 
