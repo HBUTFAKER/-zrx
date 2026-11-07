@@ -135,8 +135,8 @@ def financial_values(code6: str) -> dict[str, dict]:
     return out
 
 
-def all_delisted_pairs() -> dict[str, list[str]]:
-    """全部退市股 × 其在市期间的 20 个报告期（不做「已覆盖」扣减）。
+def all_delisted_pairs(from_year: int = 2018, to_year: int = 2022) -> dict[str, list[str]]:
+    """全部退市股 × 其在市期间内的报告期（不做「已覆盖」扣减）。
 
     为什么要全量而不用 missing_pairs：
         baostock 补的那批退市股里 MBRevenue 缺失率 55%，经营现金流只有比率没有绝对值，
@@ -159,7 +159,7 @@ def all_delisted_pairs() -> dict[str, list[str]]:
     import bisect
 
     out: dict[str, list[str]] = {}
-    period_dates = [f"{y}-{m}" for y in range(2018, 2023)
+    period_dates = [f"{y}-{m}" for y in range(from_year, to_year + 1)
                     for m in ("03-31", "06-30", "09-30", "12-31")]
     by_code = {c: sorted(g["date"].unique()) for c, g in pool.groupby("code")}
     for c, ds in by_code.items():
@@ -182,10 +182,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="只处理指定代码，逗号分隔，如 sz.300089,sz.002680")
     ap.add_argument("--all-delisted", action="store_true",
                     help="覆盖全部退市股的全部期次（不只看缺口），用于替换 baostock 的残缺数据")
+    ap.add_argument("--from-year", type=int, default=2018, help="报告期起始年（含）")
+    ap.add_argument("--to-year", type=int, default=2022, help="报告期结束年（含）")
     args = ap.parse_args(argv)
 
     if args.all_delisted:
-        by_code = all_delisted_pairs()
+        by_code = all_delisted_pairs(args.from_year, args.to_year)
         miss_n = sum(len(v) for v in by_code.values())
     else:
         miss = missing_pairs()
@@ -239,7 +241,8 @@ def main(argv: list[str] | None = None) -> int:
     df = pd.DataFrame(rows)
     df["npMargin"] = (df["netProfit"] / df["MBRevenue"].where(df["MBRevenue"] != 0) * 100).round(4)
     df = df.sort_values(["code", "statDate"])
-    out = RAW_FIN / f"finance_cninfo_delisted_2018_2022_{TODAY}.parquet"
+    out = RAW_FIN / (f"finance_cninfo_delisted_{args.from_year}_{args.to_year}_"
+                     f"{TODAY}.parquet")
     df.to_parquet(out, index=False)
 
     print(f"\n[cninfo] 落盘 {out.name}: {len(df)} 行 / {df['code'].nunique()} 只")

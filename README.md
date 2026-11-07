@@ -67,12 +67,14 @@ python -m src.ingest --stage meta
 # 2) 全 A 日线（按年分 parquet）+ 复权因子
 python -m src.ingest --stage daily --years 2018 2024
 
-# 3) 季频财务主体：东财全市场三表（20 个报告期约 7 分钟）
-python -m src.ingest_ak_fin --from-year 2018 --to-year 2022
+# 3) 季频财务主体：东财全市场三表（32 个报告期约 10 分钟）
+python -m src.ingest_ak_fin --from-year 2018 --to-year 2024
 
-# 4) 退市股财务补齐：巨潮取首次披露日 + 新浪取数值（246 只约 23 分钟）
+# 4) 退市股财务补齐：巨潮取首次披露日 + 新浪取数值
 #    东财把退市股从历史报告期里剔除了，不补就是生存偏差
-python -m src.fill_delisted_cninfo --all-delisted
+#    2018-2022 约 23 分钟；回测窗口后移到 2023 时还要单独补 2023-2024（约 15 分钟）
+python -m src.fill_delisted_cninfo --all-delisted --from-year 2018 --to-year 2022
+python -m src.fill_delisted_cninfo --all-delisted --from-year 2023 --to-year 2024
 
 # 5) 清洗入 cache.db + 生成字段字典
 python -m src.clean --years 2018 2024
@@ -92,9 +94,9 @@ pytest
 | `data/raw/meta/` | 股票清单、复权因子、行业分类 |
 | `data/raw/delisted.csv` | 退市清单（akshare 沪深 + baostock 补全） |
 | `data/cache/daily_{年}.parquet` | 清洗宽表：新增 `hfq_*`、`suspended`、`new_stock`、`listed_days` |
-| `data/cache/finance.parquet` | 财务宽表（含推算列 `cfo_est`，已标注；`source` 列标来源） |
+| `data/cache/finance.parquet` | 财务宽表（含推算列 `cfo_est`，已标注；`source` 列标来源；`pubDate_est` 为回测对齐用披露日） |
 | `data/cache.db` | SQLite：`pool_daily` / `stocks` / `delisted` / `industry` / `manifest` |
-| `data/dict.md` | 字段字典（由 `src/clean.py` 生成，88 个字段，与代码同源） |
+| `data/dict.md` | 字段字典（由 `src/clean.py` 生成，90 个字段，与代码同源） |
 
 ### 几个必须知道的坑
 
@@ -114,7 +116,13 @@ pytest
 5. **比率字段统一百分数。** baostock 的 `roeAvg/gpMargin/npMargin` 是小数（0.184），
    东财和新浪是百分数（18.4）。三个源并表时已在入层 ×100 归一，
    `test_finance_units_are_percent` 守着这条线。
-6. **东财财报剔除退市股。** 2018 一季报里 250 只 2018 年后退市股只剩 19 只，
-   直接用就是生存偏差。必须跑 `fill_delisted_cninfo --all-delisted` 补齐。
-7. **增量 = 新抓取日新增文件**，历史版本永不覆盖。同一天断点续跑时按主键并集补全。
+6. **东财财报剔除退市股，且按年段补。** 2018 一季报里 250 只 2018 年后退市股只剩 19 只，
+   直接用就是生存偏差。必须跑 `fill_delisted_cninfo --all-delisted` 补齐；
+   补完 2018-2022 不等于 2023-2024 也有——**回测窗口后移就得按新年段再补一次**，
+   `test_finance_covers_delisted_in_backtest_window` 逐年把关（现 2023 覆盖 94.0%、2024 覆盖 91.4%）。
+7. **回测对齐用 `pubDate_est`，不要用 `pubDate`。** 退市股部分报告期在巨潮查不到披露日
+   （窗口内 4.1%），`pubDate_est` 用交易所法定截止日兜底（一季报 04-30 / 半年报 08-31 /
+   三季报 10-31 / 年报次年 04-30）。截止日必然 ≥ 真实披露日，只可能晚知道、不会预知；
+   `pubdate_src` 列标明哪条是实测、哪条是兜底，S3 想更严格就只取 `announce`。
+8. **增量 = 新抓取日新增文件**，历史版本永不覆盖。同一天断点续跑时按主键并集补全。
 

@@ -120,6 +120,23 @@ def test_finance_pubdate_not_before_statdate(finance: pd.DataFrame):
     assert ratio == 1.0
 
 
+def test_finance_pubdate_est_is_safe(finance: pd.DataFrame):
+    """兜底披露日 pubDate_est 必须全覆盖、且永远不早于报告期。
+
+    S3 建议用这一列对齐：实测 pubDate 缺失时取法定披露截止日。
+    截止日 ≥ 真实披露日，所以只可能晚知道；一旦倒挂就说明兜底逻辑写反了。
+    """
+    assert "pubDate_est" in finance.columns, "clean 未生成 pubDate_est，重跑 python -m src.clean"
+    assert finance["pubDate_est"].isna().sum() == 0, "pubDate_est 仍有缺失"
+    bad = finance["pubDate_est"] < finance["statDate"]
+    assert bad.sum() == 0, (
+        f"pubDate_est < statDate {int(bad.sum())} 条，"
+        f"样例：{finance[bad].head(3)[['code','statDate','pubDate_est']].to_dict('records')}")
+    # 标记列必须与实测列一致，不能出现「标了 announce 但 pubDate 是空」这种自相矛盾
+    src = finance["pubdate_src"]
+    assert ((src == "announce") == finance["pubDate"].notna()).all()
+
+
 def test_finance_has_both_dates(finance: pd.DataFrame):
     """pubDate 允许缺失，但必须受控并显式标注。
 
@@ -174,6 +191,37 @@ def test_finance_covers_delisted(finance: pd.DataFrame):
             f"退市股财务未补齐（{len(covered)}/{len(need)}）。补齐命令："
             f"python -m src.fill_delisted_cninfo --all-delisted")
     assert len(covered) >= len(need) * 0.95
+
+
+@pytest.mark.parametrize("year", [2023, 2024])
+def test_finance_covers_delisted_in_backtest_window(finance: pd.DataFrame,
+                                                  con: sqlite3.Connection, year: int):
+    """回测窗口（2023-2024）内，当年有行情的退市股必须有当年的财务记录。
+
+    上面那条只验证「表里有这个人」。2018-2022 有记录不代表 2023-2024 有，
+    把回测起点后移时必须重新补抓，否则当年的退市股全是 NaN，因子直接消失，
+    生存偏差会以更隐蔽的方式回来（不是高估，而是「坏样本被静默剔除」）。
+    """
+    f = RAW / "delisted.csv"
+    if not f.exists():
+        pytest.skip("缺 data/raw/delisted.csv，先跑 --stage meta")
+    dl = pd.read_csv(f, dtype=str)
+    dl = dl[pd.to_datetime(dl["delist_date"], errors="coerce") >= "2018-01-01"]
+    pre = dl["exchange"].str.upper().map({"SH": "sh.", "SZ": "sz.", "BJ": "bj."}).fillna("sz.")
+    dl_codes = set(pre + dl["code"].str.zfill(6))
+    pool = pd.read_sql(
+        "SELECT code, COUNT(*) n FROM pool_daily WHERE date BETWEEN ? AND ? GROUP BY code",
+        con, params=(f"{year}-01-01", f"{year}-12-31"))
+    # 只算当年有正经行情的（当年上市不足 10 天就退市的不作要求）
+    need = dl_codes & set(pool.loc[pool["n"] >= 10, "code"])
+    if not need:
+        pytest.skip(f"{year} 年没有退市股行情")
+    have = set(finance.loc[finance["year"] == year, "code"])
+    hit = need & have
+    assert len(hit) >= len(need) * 0.90, (
+        f"{year} 年退市股财务覆盖 {len(hit)}/{len(need)} = {len(hit)/len(need):.1%}，低于 90%。"
+        f"补抓：python -m src.fill_delisted_cninfo --all-delisted "
+        f"--from-year {year} --to-year {year}")
 
 
 # ---------------------------------------------------------------- 4. 股票池 / 生存偏差

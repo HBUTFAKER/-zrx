@@ -113,6 +113,8 @@ FIELD_DICT = [
     ("finance", "CFOToOR_derived", "经营现金流/营收（推算）", "%", "**推算列**：ocf_abs / MBRevenue × 100", "本层推算"),
     ("finance", "CFOToNP_derived", "经营现金流/净利润（推算）", "%", "**推算列**：ocf_abs / netProfit × 100", "本层推算"),
     ("finance", "source", "数据来源", "-", "akshare_em = 东财三表（全市场，剔除退市股）；cninfo+sina = 巨潮公告日 + 新浪数值（补退市股，字段完整）；baostock = 退市股兜底（MBRevenue 缺失率 55%，仅在前两者覆盖不到的期次生效）", "本层标注"),
+    ("finance", "pubdate_src", "披露日来源标记", "-", "announce = pubDate 为实测公告日；deadline_est = 实测缺失，pubDate_est 用法定截止日兜底", "本层计算"),
+    ("finance", "pubDate_est", "可用披露日（含兜底）", "YYYY-MM-DD", "回测对齐**推荐用这一列**：= pubDate，缺失时取交易所法定披露截止日（一季报 04-30 / 半年报 08-31 / 三季报 10-31 / 年报次年 04-30）。截止日必然 ≥ 真实披露日，只可能晚知道、不可能预知未来", "本层计算"),
     ("finance", "fetch_date", "抓取日期", "YYYY-MM-DD", "溯源用", "本层写入"),
 
     ("pool_daily", "date", "交易日期", "YYYY-MM-DD", "交易日", "由 daily 派生"),
@@ -155,6 +157,33 @@ def _latest(files: list[Path], key: tuple[str, ...] = ("code", "date")) -> pd.Da
     out = out.sort_values(list(key) + ["_src"]).drop_duplicates(
         subset=list(key), keep="last")
     return out.drop(columns=["_src"])
+
+
+def _add_pubdate_est(fin: pd.DataFrame) -> pd.DataFrame:
+    """给缺失披露日的财务行补一个「保守估计日」——只往后推，绝不往前挪。
+
+    为什么需要：退市股通道（巨潮公告列表）只能解析到带「年度报告/半年度报告」字样的公告，
+    部分退市股期间只发了摘要或干脆查不到，pubDate 就是 NaN（2023-2024 窗口约 4.1%）。
+    S3 若直接丢掉这些行，当年的退市股因子会整段消失 = 换了个更隐蔽的生存偏差。
+
+    做法：用交易所法定披露截止日兜底 —— 一季报 04-30、半年报 08-31、三季报 10-31、
+    年报次年 04-30。截止日必然 ≥ 真实披露日，因此用它只可能「晚知道」，不可能预知未来。
+    原始 pubDate 一列不动（仍是 NaN），另开两列：pubDate_est=可用于回测的日期，
+    pubdate_src=announce（实测）/ deadline_est（截止日兜底），让 S3 能自己选择严格程度。
+    """
+    st = pd.to_datetime(fin["statDate"], errors="coerce")
+    mon, yr = st.dt.month, st.dt.year
+    deal = pd.Series(pd.NaT, index=fin.index, dtype="datetime64[ns]")
+    for mm, (dm, dd, addy) in {3: (4, 30, 0), 6: (8, 31, 0),
+                               9: (10, 31, 0), 12: (4, 30, 1)}.items():
+        sel = mon == mm
+        if sel.any():
+            deal.loc[sel] = pd.to_datetime(
+                (yr[sel] + addy).astype(int).astype(str)
+                + f"-{dm:02d}-{dd:02d}", errors="coerce")
+    fin["pubdate_src"] = np.where(fin["pubDate"].notna(), "announce", "deadline_est")
+    fin["pubDate_est"] = fin["pubDate"].fillna(deal.dt.strftime("%Y-%m-%d"))
+    return fin
 
 
 def _db() -> sqlite3.Connection:
@@ -335,6 +364,7 @@ def clean(years: list[int]) -> dict:
         fin["cfo_est"] = cfo
         fin = fin.drop(columns=[c for c in ("year",) if c in fin.columns])
         fin["year"] = fin["statDate"].str.slice(0, 4).astype("int16")
+        fin = _add_pubdate_est(fin)
         fin = fin.sort_values(["code", "statDate"])
         fin.to_parquet(CACHE / "finance.parquet", index=False)
         stats["finance"] = len(fin)

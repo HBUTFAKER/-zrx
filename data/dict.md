@@ -78,6 +78,8 @@
 | `CFOToOR_derived` | 经营现金流/营收（推算） | % | **推算列**：ocf_abs / MBRevenue × 100 | 本层推算 |
 | `CFOToNP_derived` | 经营现金流/净利润（推算） | % | **推算列**：ocf_abs / netProfit × 100 | 本层推算 |
 | `source` | 数据来源 | - | akshare_em = 东财三表（全市场，剔除退市股）；cninfo+sina = 巨潮公告日 + 新浪数值（补退市股，字段完整）；baostock = 退市股兜底（MBRevenue 缺失率 55%，仅在前两者覆盖不到的期次生效） | 本层标注 |
+| `pubdate_src` | 披露日来源标记 | - | announce = pubDate 为实测公告日；deadline_est = 实测缺失，pubDate_est 用法定截止日兜底 | 本层计算 |
+| `pubDate_est` | 可用披露日（含兜底） | YYYY-MM-DD | 回测对齐**推荐用这一列**：= pubDate，缺失时取交易所法定披露截止日（一季报 04-30 / 半年报 08-31 / 三季报 10-31 / 年报次年 04-30）。截止日必然 ≥ 真实披露日，只可能晚知道、不可能预知未来 | 本层计算 |
 | `fetch_date` | 抓取日期 | YYYY-MM-DD | 溯源用 | 本层写入 |
 
 ## pool_daily
