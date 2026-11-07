@@ -245,6 +245,20 @@ def test_pool_daily_covers_sample(con: sqlite3.Connection):
         assert n > 0, f"{name} {code} 不在 pool_daily 里"
 
 
+def test_data_is_fresh(con: sqlite3.Connection):
+    """数据必须同步到最近 45 天内，防止拿半年前的池子当"最新"跑回测。
+
+    教训：2026-11 之前数据只到 2024-12-31，回测窗口白白少两年，
+    而所有测试都绿——因为没有一条测试关心"最后一根 K 线是哪天"。
+    """
+    mx = con.execute("SELECT MAX(date) FROM pool_daily").fetchone()[0]
+    assert mx is not None, "pool_daily 是空的"
+    limit_date = (pd.Timestamp.today() - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+    assert mx >= limit_date, (
+        f"pool_daily 最新日期 {mx}，早于 {limit_date}。"
+        f"补数据：python -m src.ingest --stage daily --years 2025 2026 再重跑 clean")
+
+
 def test_new_stock_flag_matches_listed_days(con: sqlite3.Connection):
     """new_stock 必须是 listed_days < 120，标志位和数值不能打架。"""
     bad = con.execute(

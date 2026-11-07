@@ -65,16 +65,18 @@ quant-app/
 python -m src.ingest --stage meta
 
 # 2) 全 A 日线（按年分 parquet）+ 复权因子
-python -m src.ingest --stage daily --years 2018 2024
+#    全量 2018-2026 约一小时（workers=3）；增量只跑缺的年份
+python -m src.ingest --stage daily --years 2018 2026
 
 # 3) 季频财务主体：东财全市场三表（32 个报告期约 10 分钟）
-python -m src.ingest_ak_fin --from-year 2018 --to-year 2024
+python -m src.ingest_ak_fin --from-year 2018 --to-year 2026
 
 # 4) 退市股财务补齐：巨潮取首次披露日 + 新浪取数值
 #    东财把退市股从历史报告期里剔除了，不补就是生存偏差
-#    2018-2022 约 23 分钟；回测窗口后移到 2023 时还要单独补 2023-2024（约 15 分钟）
+#    按年段分开跑：窗口后移就补新年段（每段 10-25 分钟）
 python -m src.fill_delisted_cninfo --all-delisted --from-year 2018 --to-year 2022
 python -m src.fill_delisted_cninfo --all-delisted --from-year 2023 --to-year 2024
+python -m src.fill_delisted_cninfo --all-delisted --from-year 2025 --to-year 2026
 
 # 5) 清洗入 cache.db + 生成字段字典
 python -m src.clean --years 2018 2024
