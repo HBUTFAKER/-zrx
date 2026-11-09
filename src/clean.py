@@ -66,7 +66,7 @@ FIELD_DICT = [
     ("daily", "hfq_high", "最高价（后复权）", "元", "high × backAdjustFactor", "本层计算"),
     ("daily", "hfq_low", "最低价（后复权）", "元", "low × backAdjustFactor", "本层计算"),
     ("daily", "hfq_close", "收盘价（后复权）", "元", "close × backAdjustFactor，回测唯一可用价格列", "本层计算"),
-    ("daily", "suspended", "是否停牌", "0/1", "tradestatus=0 或成交量为 0 → 1", "本层计算"),
+    ("daily", "suspended", "是否停牌", "0/1", "tradestatus=0 或 volume=0 → 1；volume 缺失(NaN)不视为 0", "本层计算"),
     ("daily", "listed_days", "上市第几个交易日", "个", "按全市场交易日历，自 ipoDate 起算的序号", "本层计算"),
     ("daily", "new_stock", "是否次新股", "0/1", f"listed_days < {NEW_STOCK_DAYS} → 1", "本层计算"),
     ("daily", "is_delisted", "是否已退市", "0/1", "该股最终是否退市（不是当日状态），用于避免生存偏差", "baostock outDate / akshare 退市清单"),
@@ -267,7 +267,13 @@ def clean(years: list[int]) -> dict:
             df[f"hfq_{c}"] = df[c] * df["backAdjustFactor"]
 
         # ---- 停牌 / ST / 退市
-        df["suspended"] = ((df["tradestatus"] == 0) | (df["volume"].fillna(0) == 0)).astype("int8")
+        # 口径（框架 3.3 节第 3 条）字面：tradestatus==0 或成交量为 0 → 停牌。
+        # 成交量缺失（NaN）**不视为 0**：NaN 是"没拿到数"，不是"没成交"，
+        # 拿它当 0 会把数据缺口伪装成停牌，回测里凭空跳过一个交易日。
+        # 实测 2018–2026 全窗口这类行都为 tradestatus==0，故改口径不改变产物；
+        # 回归测试 test_suspended_rows_preserved_in_pool 锁住这一条。
+        vol = pd.to_numeric(df["volume"], errors="coerce")
+        df["suspended"] = ((df["tradestatus"] == 0) | (vol == 0)).astype("int8")
         df["isST"] = df["isST"].replace(-1, np.nan)
 
         meta = stocks.set_index("code")
@@ -386,6 +392,34 @@ def clean(years: list[int]) -> dict:
     return stats
 
 
+def _pubdate_missing_section() -> list[str]:
+    """pubDate 缺失按报告期年份如实统计。
+
+    为什么不写死数字：文档一写死，下次补抓就对不上，反而变成第二个「编造数据」。
+    每次生成时从 finance.parquet 重算，文档与数据同源。
+    """
+    f = CACHE / "finance.parquet"
+    if not f.exists():
+        return ["## pubDate 缺失年份清单", "",
+                "- `finance.parquet` 未生成，无法统计（先跑 `python -m src.clean`）。", ""]
+    fin = pd.read_parquet(f, columns=["pubDate", "statDate"])
+    fin = fin[fin["statDate"].notna()].copy()
+    fin["year"] = fin["statDate"].str.slice(0, 4)
+    miss = fin.groupby("year")["pubDate"].apply(lambda s: int(s.isna().sum()))
+    tot = fin.groupby("year").size()
+    lines = ["## pubDate 缺失年份清单", "",
+             "> 每次生成时按 `statDate` 年份重算；缺失是事实，只统计不插补。",
+             "> 早年缺失率高是口径造成的：次新股早年报表只出现在招股书里，",
+             "> 东财「实际披露时间表」只收录当期按期披露的在市公司；近年已收敛。", "",
+             "| 报告期年份 | 财务行数 | pubDate 缺失行数 | 占比 |", "|---|---|---|---|"]
+    for y in sorted(tot.index, key=str):
+        lines.append(f"| {y} | {int(tot[y])} | {int(miss[y])} | {miss[y] / tot[y]:.1%} |")
+    lines.append(f"| **合计** | {len(fin)} | {int(fin['pubDate'].isna().sum())} | "
+                 f"{fin['pubDate'].isna().mean():.1%} |")
+    lines.append("")
+    return lines
+
+
 def write_dict() -> None:
     """生成字段字典，保证文档与代码同源。"""
     lines = ["# 字段字典（data/dict.md）", "",
@@ -397,9 +431,17 @@ def write_dict() -> None:
             lines += ["", f"## {tbl}", "", "| 字段 | 中文名 | 单位 | 口径 | 来源 |", "|---|---|---|---|---|"]
             cur = tbl
         lines.append(f"| `{col}` | {cn} | {unit} | {desc} | {src} |")
-    lines += ["", "## 缺失值约定", "",
+    lines += [""] + _pubdate_missing_section()
+    lines += ["## 缺失值约定", "",
               "- 所有缺失一律写 NaN / NULL，**不插补、不估算、不线性填充**。",
-              "- 唯一例外：`finance.cfo_est`（经营现金流推算值），已在该行口径里标为推算，不得当作披露原值引用。",
+              "- `finance.pubDate` 缺失照留 NaN，不拿别的日期顶替；另有两列兜底与标记：",
+              "  - `pubDate_est`：= `pubDate`；缺失时取交易所法定披露截止日（一季报 04-30 / 半年报 08-31 /",
+              "    三季报 10-31 / 年报次年 04-30）。截止日必然 ≥ 真实披露日，只可能晚知道、不可能提前。",
+              "    **回测对齐用这一列**。",
+              "  - `pubdate_src`：`announce` = 实测公告日；`deadline_est` = 用了截止日兜底，需自行判断严格程度。",
+              "- 推算列是唯一允许的「非披露值」，一律带 `_derived` / `_est` 后缀，不得当作披露原值引用：",
+              "  `roeAvg_derived` / `npMargin_derived` / `gpMargin_derived` / `CFOToOR_derived` /",
+              "  `CFOToNP_derived` / `cfo_est`。推算列自身缺失时仍为 NaN，不做二次填充。",
               "- 下游展示缺失值时必须显示「缺失」，不得用 0 或均值替代。", ""]
     DICT_MD.write_text("\n".join(lines), encoding="utf-8")
     print(f"[clean] 字段字典已写入 {DICT_MD.relative_to(ROOT)}（{len(FIELD_DICT)} 个字段）")

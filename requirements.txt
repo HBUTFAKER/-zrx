@@ -1,7 +1,10 @@
-pandas
-numpy
-baostock
-akshare
-streamlit
-pytest
-pyarrow
+# 版本锁定：2026-11-09 在 Python 3.13.14 + .venv 下实测安装通过
+# numpy 2.5.4 要求 Python >=3.12，Python 3.11 无法安装本套依赖
+# 换机照此文件装即可复现；要升级先单独验证再改这里
+pandas==3.1.1
+numpy==2.5.4
+baostock==0.9.4
+akshare==1.20.36
+streamlit==1.67.0
+pytest==9.2.0
+pyarrow==26.0.1

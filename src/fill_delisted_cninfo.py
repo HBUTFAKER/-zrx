@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 
@@ -28,6 +29,9 @@ import pandas as pd
 
 from .fill_delisted_gap import missing_pairs
 from .ingest import RAW_FIN, TODAY
+
+STATE = RAW_FIN.parent / "_state"
+FAIL_LOG = STATE / "finance_cninfo_failed.json"
 
 # 标题里出现这些词的一律不是「首次披露的定期报告正文」
 # 注意：不能排除「全文/正文」—— 大量定期报告的真实标题就是「2020年第三季度报告全文」，
@@ -174,6 +178,29 @@ def all_delisted_pairs(from_year: int = 2018, to_year: int = 2022) -> dict[str, 
     return {c: sorted(set(v)) for c, v in out.items()}
 
 
+def _save_fail(failed: dict[str, dict], ok: list[str]) -> None:
+    """把「试过但一条没取到」的股票逐只写进 _state，供 gaps.csv 的 finance_fetch_failed 使用。
+
+    为什么必须落盘：三条底线之一是不静默跳过。抓不到就是抓不到，得留下凭据；
+    反过来，后续补抓成功的要从名单里摘掉，否则台账会一直挂着已解决的旧账。
+    """
+    STATE.mkdir(parents=True, exist_ok=True)
+    items: dict[str, dict] = {}
+    if FAIL_LOG.exists():
+        try:
+            items = json.loads(FAIL_LOG.read_text(encoding="utf-8")).get("items", {})
+        except Exception as e:  # noqa: BLE001  坏文件不该阻断主流程，但要吼一声
+            print(f"  [warn] 失败名单解析失败，按空表重写 {FAIL_LOG.name}: {e}")
+    items.update(failed)
+    for c in ok:
+        items.pop(c, None)
+    FAIL_LOG.write_text(
+        json.dumps({"updated": TODAY, "items": items}, ensure_ascii=False, indent=1),
+        encoding="utf-8")
+    if failed:
+        print(f"[cninfo] 失败名单 {len(failed)} 只已写入 {FAIL_LOG.relative_to(STATE.parent.parent)}")
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sleep", type=float, default=0.4, help="每次外部请求后休眠秒数")
@@ -210,13 +237,22 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict] = []
     no_pub: list[str] = []
     no_val: list[str] = []
+    failed: dict[str, dict] = {}
+    ok: list[str] = []
     t0 = time.time()
     for k, code in enumerate(codes, 1):
         c6 = code.split(".")[1]
-        pubs = disclosure_dates(c6)
-        time.sleep(args.sleep)
-        vals = financial_values(c6)
-        time.sleep(args.sleep)
+        try:
+            pubs = disclosure_dates(c6)
+            time.sleep(args.sleep)
+            vals = financial_values(c6)
+            time.sleep(args.sleep)
+        except Exception as e:  # noqa: BLE001  单只异常不该拖垮整批，但必须记账
+            print(f"  {k}/{len(codes)} {code}: 请求异常 {type(e).__name__}: {e}", flush=True)
+            failed[code] = {"from_year": args.from_year, "to_year": args.to_year,
+                            "fetch_date": TODAY, "reason": f"request_error:{type(e).__name__}",
+                            "periods": by_code[code]}
+            continue
         got = 0
         for stat in by_code[code]:
             pub = pubs.get(stat)
@@ -231,8 +267,18 @@ def main(argv: list[str] | None = None) -> int:
             got += 1
             if not pub:
                 no_pub.append(f"{code}|{stat}")
+        if got:
+            ok.append(code)
+        else:
+            # 一条都没取到：源站确实没有这些期次（退市当年通常不再出定期报告），
+            # 但必须逐只留档，不能静默当作"没缺口"
+            failed[code] = {"from_year": args.from_year, "to_year": args.to_year,
+                            "fetch_date": TODAY, "reason": "no_data_at_source",
+                            "periods": by_code[code]}
         print(f"  {k}/{len(codes)} {code}: 补 {got} 期 "
               f"(公告日命中 {sum(1 for s in by_code[code] if s in pubs)})", flush=True)
+
+    _save_fail(failed, ok)
 
     if not rows:
         print("[cninfo] 没有取到任何数据")

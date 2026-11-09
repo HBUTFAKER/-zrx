@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.gaps import record_gaps
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 RAW = DATA / "raw"
@@ -286,7 +288,7 @@ def _daily_chunk(job: tuple) -> dict:
         return {"idx": idx, "ok": False, "banned": True, "err": str(e)}
     except Exception as e:  # noqa: BLE001
         return {"idx": idx, "ok": False, "err": f"login: {e}"}
-    frames, fac_rows, bad = [], [], []
+    frames, fac_rows, bad, bad_factor = [], [], [], []
     for c in codes:
         f, r = _query_with_retry(
             bs, bs.query_history_k_data_plus, code=c,
@@ -298,6 +300,10 @@ def _daily_chunk(job: tuple) -> dict:
             frames.append(pd.DataFrame(r, columns=f))
         f2, r2 = _query_with_retry(bs, bs.query_adjust_factor, code=c,
                                    start_date="1990-01-01", end_date=end)
+        if not r2:
+            # 降级路径 2：因子拉不到就没有后复权价，必须留痕。
+            # 注意空结果也可能只是"从未分红"，台账里标 factor_missing 待人工核查，不静默丢弃。
+            bad_factor.append(c)
         for row in r2:
             fac_rows.append({"code": row[0], "dividOperateDate": row[1],
                              "foreAdjustFactor": _num(row[2]), "backAdjustFactor": _num(row[3])})
@@ -307,7 +313,7 @@ def _daily_chunk(job: tuple) -> dict:
         pass
 
     if not frames:
-        return {"idx": idx, "ok": True, "rows": 0, "bad": bad}
+        return {"idx": idx, "ok": True, "rows": 0, "bad": bad, "bad_factor": bad_factor}
     df = pd.concat(frames, ignore_index=True)
     for c in DAILY_NUM:
         df[c] = df[c].map(_num)
@@ -320,7 +326,20 @@ def _daily_chunk(job: tuple) -> dict:
     df.to_parquet(p, index=False)
     if fac_rows:
         pd.DataFrame(fac_rows).to_parquet(RAW_TMP / f"factor_{tag}_{idx}.parquet", index=False)
-    return {"idx": idx, "ok": True, "rows": len(df), "bad": bad}
+    return {"idx": idx, "ok": True, "rows": len(df), "bad": bad,
+            "bad_factor": bad_factor}
+
+
+def _record_daily_gaps(res: dict) -> None:
+    """降级路径落台账：日线拉不到、复权因子拉不到，逐只写 data/gaps.csv。
+
+    之前这两条路径只把代码塞进 _state 的 failed 名单，没人看就等于静默跳过。
+    现在同时写台账——审计可以直接拿 gaps.csv 对账。
+    """
+    items = [(c, "daily_missing") for c in (res.get("bad") or [])]
+    items += [(c, "factor_missing") for c in (res.get("bad_factor") or [])]
+    if items:
+        record_gaps(items)
 
 
 def ingest_daily(years: list[int], workers: int = 3, chunk: int = 120,
@@ -354,6 +373,7 @@ def ingest_daily(years: list[int], workers: int = 3, chunk: int = 120,
                     st["done_chunks"].append(res["idx"])
                     if res.get("bad"):
                         st["failed"].extend(res["bad"])
+                    _record_daily_gaps(res)
                 else:
                     st["failed"].append(f"chunk{res['idx']}:{res['err']}")
                 if k % 5 == 0 or k == len(jobs):
@@ -368,6 +388,7 @@ def ingest_daily(years: list[int], workers: int = 3, chunk: int = 120,
             if res.get("ok"):
                 st["done_chunks"].append(res["idx"])
                 st["failed"].extend(res.get("bad", []))
+                _record_daily_gaps(res)
             _save_state(st_path, st)
             print(f"  进度 {k}/{len(jobs)} 分片")
 
@@ -377,9 +398,13 @@ def ingest_daily(years: list[int], workers: int = 3, chunk: int = 120,
 def _merge_daily_parts(years: list[int], tag: str) -> None:
     """合并分片 → 按年落 parquet。
 
-    与"只增不改"的关系：raw 文件的多版本靠**文件名里的抓取日期**区分，历史版本永不删除。
-    同一天内断点续跑时，用"已有当日文件 + 新分片"并集重写当日文件——这不是修改历史，
-    只是把同一抓取日的数据补全（同一 (code,date) 保留最后写入的那条）。
+    落盘规则分两层，别混：
+      1) **同日并集**：同一天内断点续跑，本函数读"已存在的当日文件 + 新分片"，
+         按 (code, date) 去重后整份重写当日文件（keep="last"，后写入的分片优先）。
+         这不算改历史——同一天的所有分片本就属于同一份抓取快照，取并集才是完整快照。
+      2) **跨日只增不改**：文件名带抓取日期（daily_{年}_{YYYY-MM-DD}.parquet），
+         新抓取日写新文件，旧文件一律不动、不删、不覆盖。
+         下游 src/clean.py 的 _latest() 按文件名排序取最新一份，历史版本可随时回溯。
     """
     parts = sorted(RAW_TMP.glob(f"daily_{tag}_*.parquet"))
     if not parts:
@@ -455,7 +480,9 @@ def _finance_chunk(job: tuple) -> dict:
                         rec[col] = _num(d.get(col))
                 if got and rec["statDate"]:
                     rows.append(rec)
-                elif not got:
+                else:
+                    # 降级路径 3：接口全空，或返回了但缺 statDate——两者都等于"没拿到"。
+                    # 以前第二种情况被静默丢掉，退市股财务缺口因此不留痕。
                     bad.append(f"{c}:{y}Q{q}")
     try:
         bs.logout()
@@ -479,6 +506,18 @@ def _finance_chunk(job: tuple) -> dict:
     p = RAW_TMP / f"fin_{tag}_{idx}.parquet"
     df.to_parquet(p, index=False)
     return {"idx": idx, "ok": True, "rows": len(df), "bad": bad}
+
+
+def _record_finance_gaps(bad: list[str]) -> None:
+    """财务降级路径落台账。按 (code, 年份) 聚合：一期一行会把 csv 撑成几千行，年份粒度够定位。"""
+    items = set()
+    for x in bad:
+        c, _, q = str(x).partition(":")
+        if not q:
+            continue
+        items.add((c, f"finance_missing:{q[:4]}"))
+    if items:
+        record_gaps(sorted(items))
 
 
 def ingest_finance(years: list[int], workers: int = 3, chunk: int = 150,
@@ -511,6 +550,7 @@ def ingest_finance(years: list[int], workers: int = 3, chunk: int = 150,
                     st["done_chunks"].append(res["idx"])
                     if res.get("bad"):
                         st["failed"].extend(res["bad"][:200])
+                        _record_finance_gaps(res["bad"])
                 else:
                     st["failed"].append(f"chunk{res['idx']}:{res['err']}")
                 if k % 5 == 0 or k == len(jobs):
@@ -525,6 +565,7 @@ def ingest_finance(years: list[int], workers: int = 3, chunk: int = 150,
             if res.get("ok"):
                 st["done_chunks"].append(res["idx"])
                 st["failed"].extend(res.get("bad", [])[:200])
+                _record_finance_gaps(res.get("bad", []))
             _save_state(st_path, st)
             print(f"  进度 {k}/{len(jobs)} 分片")
 
