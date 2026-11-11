@@ -160,6 +160,11 @@ def equal_weight_market(panel) -> pd.Series:
 
     为什么含退市股：面板本身来自 pool_daily 派生的宽表，退市股保留到最后交易日（3.3-4），
     用"今天的成分股"回测历史会系统性高估收益。停牌股当日无收益（价格不变），自然计 0。
+
+    已知口径差异（003R4 / 审计 B4-06，**只记录不改逻辑**）：hfq 缺口格的收盘价是 NaN，
+    该股缺口当日的收益因此被 `nanmean` **剔除**（等于当天不参与等权），而不是按 0 收益计入。
+    实测影响 < 0.01pp（缺口仅 1,942 行 / 2 只 / 9 年面板）。总工裁定：S2 不动这条逻辑，
+    等 004 因子框架设计时统一处理（届时要么缺口股整天剔除，要么按冻结价计 0 收益，两者择一）。
     """
     px = panel.close_hfq
     prev = np.vstack([np.full((1, px.shape[1]), np.nan), px[:-1]])
@@ -313,8 +318,12 @@ def format_card(m: dict) -> str:
     lines.append(f"  年化 {pct(o['ann_return'])} | 波动 {pct(o['ann_vol'])} | "
                  f"回撤 {pct(o['mdd'])} | 夏普 {num(o['sharpe'])}")
     lines.append("----------------------------------------")
-    # 审计 B3-02：指标卡最容易被截图传播，必须自带边界声明，防止被当成 alpha 证据
+    # 审计 B3-02 / B4-03：指标卡最容易被截图传播，必须自带边界声明，防止被当成 alpha 证据
     lines.append("  注：自检脚手架结果，非策略有效性/alpha 证据；")
-    lines.append("      超额受整手倾斜、seed 敏感度、可交易性过滤影响（见 result.json.extra.validity_note）")
+    lines.append("      seed 40~50 共 11 个：年化 5.1113%~7.0189%，级差 1.9076pp，"
+                 "中位 5.9884%，")
+    lines.append("      seed=42 恰在中位（升序第 6/11，54.5 分位）；"
+                 "超额另有整手倾斜与可交易性过滤")
+    lines.append("      口径见 result.json.extra.validity_note")
     lines.append("========================================")
     return "\n".join(lines)

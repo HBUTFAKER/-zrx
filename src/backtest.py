@@ -103,7 +103,8 @@ LIMIT_TOL = 0.005   # 涨跌停判定容差：只可能差 1 个 tick（半分�
 VALIDITY_NOTE = (
     "本文数字是引擎自检脚手架（固定种子等权持有 N 只、月度再平衡）的运行结果，"
     "不是策略有效性或 alpha 的证据。已知偏差：整手低价股倾斜、seed 敏感度"
-    "（实测 seed 40~50 年化 5.11%~7.02%，级差 1.91pp，seed=42 处 27.3 分位）、"
+    "（实测 seed 40~50 共 11 个：年化 5.1113%~7.0189%，级差 1.9076pp，"
+    "中位 5.9884%，seed=42 恰好落在中位（升序第 6/11，54.5 分位））、"
     "可交易性过滤、成本与开盘滞后。策略有效性判断以 004 因子框架的 holdout 结果为准，"
     "不以 S2 全量回测收益为准。")
 
@@ -283,10 +284,94 @@ class Panel:
         if self.hfq_gap is None:
             # 人工面板默认无缺口；真实数据由 load_panel 显式标注
             self.hfq_gap = np.zeros(self.open_hfq.shape, dtype=bool)
+        self._check_hfq_gap_consistent()
+
+    def _check_hfq_gap_consistent(self) -> None:
+        """旗标与数据一致性校验（003R4 / 审计 B4-02②）。
+
+        `hfq_gap` 是"原始价有、复权价缺"的**唯一**判据：不可交易掩码、估值冻结、
+        末端清算全靠它。一旦旗标与数据脱同步（手工面板忘标、便宜行事先填好 hfq、
+        clean 层换了复权因子来源），B3-01 那类幻影层就会**静默**复发——净值悄悄变好，
+        没有任何一行日志。所以这里在构造面板时就硬校验，两个方向都查：
+
+          · 标了缺口却没缺 → 幻影层的典型形态（缺口期按因子 1 记账），抛错；
+          · 缺了却没标缺口 → 该格会被当作正常可交易，卖出/估值拿 NaN 走兜底，抛错。
+        """
+        miss = ((~np.isnan(self.open_raw) & np.isnan(self.open_hfq))
+                | (~np.isnan(self.close_raw) & np.isnan(self.close_hfq)))
+        gap = np.asarray(self.hfq_gap, dtype=bool)
+        if gap.shape != miss.shape:
+            raise ValueError(f"hfq_gap 形状 {gap.shape} 与价格矩阵 {miss.shape} 不一致")
+        stale = gap & ~miss
+        if stale.any():
+            r, c = np.argwhere(stale)[0]
+            raise ValueError(
+                f"hfq_gap 标记与数据脱同步：{self.dates[r]} {self.codes[c]} 标为缺口，"
+                f"但 open/close 与 hfq 价格都在（共 {int(stale.sum())} 格）——"
+                f"缺口期会被当成正常可交易，幻影层会静默复发（审计 B3-01/B4-02）")
+        unflagged = miss & ~gap
+        if unflagged.any():
+            r, c = np.argwhere(unflagged)[0]
+            raise ValueError(
+                f"hfq 缺失但未标 hfq_gap：{self.dates[r]} {self.codes[c]}"
+                f"有原始价却无复权价（共 {int(unflagged.sum())} 格）——"
+                f"该格会被当正常可交易，估值/变现只能拿原始价顶替（审计 B4-02）")
 
     @property
     def shape(self) -> tuple[int, int]:
         return self.open_hfq.shape
+
+
+def _liquidation_due(shares: np.ndarray, last_valid: np.ndarray,
+                     last_hfq_valid: np.ndarray, i: int, n_d: int) -> dict[int, bool]:
+    """当日到期的强制清算清单 `{列号: 是否因 hfq 断供}`（003R4 / 审计 B4-01、B4-07①）。
+
+    终止点取原始价与 hfq 的**较早**者：任一侧断供都无法继续按同一口径估值。
+    `from_gap` 仅在 `hfq_lv < raw_lv`（hfq 先断供）时为真 —— 原始价先终止就是退市，
+    哪怕当天恰好落在缺口段里，reason 也必须记 `delisted`，不能把退市记成数据缺口。
+
+    只对"终止日 < 回测末日"的股票返回：末日仍有效的持仓按市值留在账上，那是期末估值。
+    """
+    out: dict[int, bool] = {}
+    for j in np.nonzero(shares > 0)[0]:
+        raw_lv, hfq_lv = int(last_valid[j]), int(last_hfq_valid[j])
+        if raw_lv < 0 and hfq_lv < 0:
+            continue                                  # 完全没有行情，无从清算
+        if raw_lv < 0:
+            liq_at, from_gap = hfq_lv, False
+        elif hfq_lv < 0:
+            liq_at, from_gap = raw_lv, False          # hfq 整列缺失不算"缺口先断供"
+        elif hfq_lv < raw_lv:
+            liq_at, from_gap = hfq_lv, True
+        else:
+            liq_at, from_gap = raw_lv, False
+        if liq_at != i or liq_at >= n_d - 1:
+            continue
+        out[int(j)] = from_gap
+    return out
+
+
+def _exit_prices(raw_px: float, hfq_px: float, last_raw: float, last_hfq: float,
+                 code: str, date: str) -> tuple[float, float]:
+    """清算用的两个价：原始价（费用/台账基数）与 hfq 价（变现）。
+
+    hfq 从"当日价 → 最后有效价"依次取，**取不到就停工**（003R4 / 审计 B4-02①）。
+    旧代码在这里 `else px` 拿原始价顶替：人工面板 hfq 全缺时 book 按原始价记，
+    pnl 被伪造成一笔假亏损（合成实证：真值 ≈102,820 记成 10,282）。
+    这与 B3-01 的红线自相矛盾（一边说"绝不拿原始价顶替"，一边留着这条兜底）。
+    真实 load_panel 口径下 hfq 必有值，抛错即数据异常信号，不该静默糊过去。
+    """
+    px = float(raw_px)
+    if not (np.isfinite(px) and px > 0):
+        px = float(last_raw)
+    hx = float(hfq_px)
+    if not (np.isfinite(hx) and hx > 0):
+        hx = float(last_hfq)
+    if not (np.isfinite(hx) and hx > 0):
+        raise RuntimeError(
+            f"{date} {code} 清算时拿不到 hfq 价（当日 {hfq_px!r}、最后有效 {last_hfq!r}）："
+            f"拒绝用原始价 {px!r} 顶替 —— 那会把账面价值和 pnl 一起记错（审计 B4-02）")
+    return px, hx
 
 
 def _last_valid_index(a: np.ndarray) -> np.ndarray:
@@ -531,45 +616,37 @@ def run_backtest(panel: Panel, signals: dict[str, dict[str, float]],
     gap = panel.hfq_gap
 
     # 台账计数（随 result.data 落地，可追溯）
-    ledger = {"buy_blocked": 0, "frozen_position_days": 0,
+    ledger = {"buy_blocked": 0, "sell_blocked": 0,
+              "liquidation_day_blocked": 0, "frozen_position_days": 0,
               "liquidated_hfq_gap": 0, "liquidated_hfq_gap_value": 0.0}
 
     pending: dict[str, float] = {}                   # 明日开盘要调到的目标权重
     rows, trade_rows, pos_rows, drop_rows = [], [], [], []
 
     for i, date in enumerate(panel.dates):
+        # ---------- 0) 当日到期的强制清算清单（必须在开盘交易**之前**算出来）
+        #    003R4 / 审计 B4-01：原先步骤 1（开盘买入）与步骤 2（清算）同一迭代，
+        #    清算日同时是"最后有效 hfq 日"，当日旗标仍是 False → 可以照常买入，
+        #    收盘前又被强制清算，等于同一笔钱当天买当天卖（合成复现：
+        #    2020-01-03 买 9,700 股 @10.0 → 同日清算 @10.2）。这类股票当日一律禁交易。
+        due = _liquidation_due(shares, last_valid, last_hfq_valid, i, n_d)
+        blocked = {j: "liquidating" for j in due}
+
         # ---------- 1) 开盘执行昨日信号（T+1）
         #    估值只用"<= i-1 日"的收盘价兜底，绝不读今日收盘价（3.3-1 防未来函数）
         if pending:
             cash = _execute(panel, i, pending, idx, cash, shares, nhq, cost_basis,
                             last_buy_day, last_hfq, last_raw, cfg,
-                            trade_rows, drop_rows, date)
+                            trade_rows, drop_rows, date, blocked=blocked)
 
         # ---------- 2) 数据终止清算（区间内退市 / 长时间停牌至结束 / hfq 缺口延续到末端）
         #    只对"最后有效日 < 回测末日"的股票执行：末日仍有效的持仓按市值留在账上，
         #    那是期末估值，不是清算。
         #    取原始价与 hfq 两者的**较早**终止点：任一侧断供都无法继续按同一口径估值。
-        held = np.nonzero(shares > 0)[0]
-        for j in held:
-            raw_lv, hfq_lv = int(last_valid[j]), int(last_hfq_valid[j])
-            if raw_lv < 0:
-                liq_at, from_gap = hfq_lv, True
-            elif hfq_lv < 0:
-                liq_at, from_gap = raw_lv, True
-            elif hfq_lv < raw_lv:
-                liq_at, from_gap = hfq_lv, True     # hfq 先断供 = 缺口延续到末端
-            else:
-                liq_at, from_gap = raw_lv, False
-            if liq_at != i or liq_at >= n_d - 1:
-                continue
-            px = float(raw_close[i, j])
-            if not np.isfinite(px) or px <= 0:
-                px = float(last_raw[j]) if np.isfinite(last_raw[j]) else np.nan
-            # 清算按 **hfq 口径变现**（分红层不能因为退市/断供就蒸发）；
-            # 缺口格 hfq 是 NaN，故退到最后有效 hfq 价，绝不拿原始价顶替（B3-01）。
-            hx = float(hfq_close[i, j])
-            if not np.isfinite(hx) or hx <= 0:
-                hx = float(last_hfq[j]) if np.isfinite(last_hfq[j]) else px
+        for j, from_gap in due.items():
+            px, hx = _exit_prices(float(raw_close[i, j]), float(hfq_close[i, j]),
+                                  float(last_raw[j]), float(last_hfq[j]),
+                                  panel.codes[int(j)], date)
             if from_gap:
                 ledger["liquidated_hfq_gap"] += 1
                 ledger["liquidated_hfq_gap_value"] += float(nhq[j] * hx)
@@ -604,9 +681,12 @@ def run_backtest(panel: Panel, signals: dict[str, dict[str, float]],
         "book", "proceeds", "reason"])
     positions = pd.DataFrame(pos_rows, columns=["date", "code", "shares", "price_raw", "value"])
     dropped = pd.DataFrame(drop_rows, columns=["date", "code", "side", "shares", "reason"])
-    # hfq 缺口台账（003R3 / B3-01）：禁买次数取自 dropped（同一处口径，可反查）
-    ledger["buy_blocked"] = int(((dropped["side"] == "buy")
-                                 & (dropped["reason"] == "hfq_gap")).sum()) if len(dropped) else 0
+    # hfq 缺口台账（003R3 / B3-01，003R4 补卖侧）：计数取自 dropped，同一处口径，可反查
+    if len(dropped):
+        for side in ("buy", "sell"):
+            ledger[f"{side}_blocked"] = int(((dropped["side"] == side)
+                                             & (dropped["reason"] == "hfq_gap")).sum())
+        ledger["liquidation_day_blocked"] = int((dropped["reason"] == "liquidating").sum())
     # 数据区间必须随产物落地（R5：写**真实**首末日，入参另存 requested_*）
     data = dict(panel.source)
     data.update({"start": panel.dates[0], "end": panel.dates[-1],
@@ -618,7 +698,8 @@ def run_backtest(panel: Panel, signals: dict[str, dict[str, float]],
         signals_meta={"signal_days": len(signals),
                       "dropped_orders": int(len(dropped)),
                       "note": "signals 日期 d 的信号只在 d+1 开盘执行（3.3-1）；"
-                              "遇涨跌停/停牌/hfq 缺口/T+1 未成交的订单不保留，按 reason 逐笔记入 dropped；"
+                              "遇涨跌停/停牌/hfq 缺口/当日清算/T+1 未成交的订单不保留，"
+                              "按 reason 逐笔记入 dropped；"
                               "区间内数据终止的持仓按最后有效收盘价强制清算（保守口径）；"
                               "hfq 缺口期禁买禁卖、估值冻结，缺口延续到末端按最后有效 hfq 价清算"})
 
@@ -627,11 +708,13 @@ def _execute(panel: Panel, i: int, target: dict[str, float], idx: dict[str, int]
              cash: float, shares: np.ndarray, nhq: np.ndarray, cost_basis: np.ndarray,
              last_buy_day: np.ndarray, last_hfq: np.ndarray, last_raw: np.ndarray,
              cfg: Config, trade_rows: list[dict], drop_rows: list[dict],
-             date: str) -> float:
+             date: str, blocked: dict[int, str] | None = None) -> float:
     """开盘调仓：按目标权重算出目标股数，先卖（降仓/清仓）后买（建仓/加仓）。
 
-    约束顺序（5.1）：涨跌停不可成交 → 停牌跳过 → **hfq 缺口跳过（禁买禁卖）** →
-    T+1 才能卖 → 只数/单只权重上限 → 资金约束。
+    约束顺序（5.1）：**当日清算禁交易** → 涨跌停不可成交 → 停牌跳过 →
+    **hfq 缺口跳过（禁买禁卖）** → T+1 才能卖 → 只数/单只权重上限 → 资金约束。
+    `blocked`（列号 → reason）由主循环当日清算清单给出：这些股票当天收盘前就要被强制清算，
+    开盘再买等于当天买当天卖（审计 B4-01）。
     目标股数按**原始价**折算（R1）：qty = 目标市值 / (原始开盘价 × (1+滑点))。
     卖出/清仓走 `_sell`，按 **hfq 口径变现**（含分红再投层），费用按真实原始金额计（003R2）。
     开盘缺价时估值退用**上一交易日**收盘价，绝不读当日收盘价。
@@ -671,7 +754,10 @@ def _execute(panel: Panel, i: int, target: dict[str, float], idx: dict[str, int]
         if excess_sh <= 1e-9:
             continue
         reason = None
-        if panel.hfq_gap[i, j]:
+        if blocked and int(j) in blocked:
+            # 当日收盘前就要强制清算：开盘再卖少赚一遍滑点、再买就是当天买当天卖（B4-01）
+            reason = blocked[int(j)]
+        elif panel.hfq_gap[i, j]:
             # hfq 缺口期：卖出会按 hfq 变现，而缺口格没有可信因子 —— 一律冻结（B3-01）
             reason = "hfq_gap"
         elif panel.suspended[i, j] or np.isnan(op[j]):
@@ -698,7 +784,10 @@ def _execute(panel: Panel, i: int, target: dict[str, float], idx: dict[str, int]
         if want - shares[j] < cfg.lot_size:
             continue
         reason = None
-        if panel.hfq_gap[i, j]:
+        if blocked and int(j) in blocked:
+            # 当日清算股禁买（审计 B4-01：否则当天买当天被清算，多付两遍滑点与费用）
+            reason = blocked[int(j)]
+        elif panel.hfq_gap[i, j]:
             # 缺口期开仓会在 hfq 恢复后凭空多出一层幻影市值（B3-01 实测 6.41 倍）
             reason = "hfq_gap"
         elif panel.suspended[i, j] or np.isnan(op[j]):
