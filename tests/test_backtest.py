@@ -59,7 +59,8 @@ def truncate_panel(panel: Panel, cut: str) -> Panel:
                  open_hfq=panel.open_hfq[:n], close_hfq=panel.close_hfq[:n],
                  open_raw=panel.open_raw[:n], close_raw=panel.close_raw[:n],
                  blocked_buy=panel.blocked_buy[:n], blocked_sell=panel.blocked_sell[:n],
-                 suspended=panel.suspended[:n], source=panel.source)
+                 suspended=panel.suspended[:n], source=panel.source,
+                 hfq_gap=panel.hfq_gap[:n])
 
 
 def momentum_signals(panel: Panel, every: int = 5, lookback: int = 20,
@@ -506,14 +507,14 @@ def test_cash_is_real_money():
     assert 0 < t["amount"] <= 100_000
 
 
-# ---------------------------------------------------------------- 4b. hfq 缺口（B2-05）
-def test_hfq_gap_unified_degradation():
-    """审计 B2-05：原始价有、hfq 缺失时必须**统一按原始价降级**并计数，不许静默双分支。
+# ---------------------------------------------------------------- 4b. hfq 缺口（B2-05 / B3-01）
+def test_hfq_gap_marked_not_filled():
+    """审计 B2-05 + B3-01：hfq 缺口必须**只标注、不插补**，且缺口行打上不可交易标记。
 
-    实测缺口 1,942 行 / 2 只。旧实现买入口有 `if hfq 有效: 按 hfq 折股 else: 按金额折股`
-    两条分支，卖出侧却只认原始价 —— 同一只股票在同一次回测里两套口径混用。
+    003R2 曾按"hfq := 原始价（因子 1）"填平缺口，结果为 sz.001914 造出 6.41 倍幻影层。
+    003R3 起缺口保持 NaN，靠 hfq_gap 标记禁买/冻结/末端清算。
     """
-    from src.backtest import _fill_hfq_gap
+    from src.backtest import _mark_hfq_gap
     df = pd.DataFrame({
         "code": ["sh.600000", "sh.600000", "sh.600001"],
         "date": ["2020-01-02", "2020-01-03", "2020-01-02"],
@@ -522,37 +523,201 @@ def test_hfq_gap_unified_degradation():
         "hfq_open": [1000.0, np.nan, 20.0],
         "hfq_close": [1000.0, np.nan, 20.0],
     })
-    out, st = _fill_hfq_gap(df)
+    out, st = _mark_hfq_gap(df)
     assert st["rows"] == 1 and st["codes"] == ["sh.600000"], f"缺口统计不对：{st}"
     assert st["open_rows"] == 1
-    # 降级口径：hfq := 原始价（复权因子 1），不是插补、不是丢行
-    assert out.loc[1, "hfq_close"] == pytest.approx(10.6)
-    assert out.loc[1, "hfq_open"] == pytest.approx(10.5)
+    # 不插补：缺口行仍是 NaN，不许被填成原始价
+    assert np.isnan(out.loc[1, "hfq_close"]), "缺口被填充了 —— B3-01 幻影层会回来"
+    assert np.isnan(out.loc[1, "hfq_open"]), "缺口被填充了"
     assert len(out) == len(df), "缺口行不许被丢掉"
+    # 标记：缺口行 True，正常行 False
+    assert bool(out.loc[1, "hfq_gap"]) and not bool(out.loc[0, "hfq_gap"])
+    assert not bool(out.loc[2, "hfq_gap"])
     # 无缺口的行必须原样保留
     assert out.loc[0, "hfq_close"] == pytest.approx(1000.0)
+    assert "不插补" in st["policy"]
 
 
 def test_hfq_gap_real_data_count_and_result_field():
     """真实数据锁：缺口 1,942 行 / 2 只（sz.001914、sz.302132），且计数必须落进 result.data。
 
     数量是审计复算过的口径；一旦 clean 层换了复权因子来源，这里先红，不至于让回测
-    在无声降级中跑完。
+    在无声降级中跑完。缺口在面板里必须仍是 NaN + 不可交易标记（B3-01）。
     """
     codes = ["sz.001914", "sz.302132"]
     p = load_panel("2018-01-02", "2026-11-06", codes=codes)
     g = p.source["hfq_gap_rows"]
     assert g["rows"] == 1942, f"缺口行数 {g['rows']} 与审计口径 1,942 不符"
     assert g["codes"] == sorted(codes), f"缺口股票清单不对：{g['codes']}"
-    # 填充后：凡有原始价的行都必须有 hfq
-    leftover = (~np.isnan(p.close_raw)) & np.isnan(p.close_hfq)
-    assert not leftover.any(), f"填充后仍有 {int(leftover.sum())} 行 hfq 缺失"
+    # 缺口行保持 NaN（不插补），且被打上 hfq_gap 标记
+    gap_cells = p.hfq_gap
+    assert int(gap_cells.sum()) == 1942, f"缺口标记 {int(gap_cells.sum())} 行，应为 1,942"
+    assert bool(np.isnan(p.close_hfq[gap_cells]).all()), "缺口格 hfq 被填了值"
+    # 反向：有原始价但既无 hfq 又没被标记的行必须为 0（否则是漏标）
+    miss = (~np.isnan(p.close_raw)) & np.isnan(p.close_hfq) & ~gap_cells
+    assert not miss.any(), f"有 {int(miss.sum())} 行 hfq 缺失却没有缺口标记"
 
-    # 计数必须随产物落地（result.json 的 data.hfq_gap_rows）
+    # 计数必须随产物落地（result.json 的 data.hfq_gap_rows），并附台账
     cfg = Config(start="2018-01-02", end="2026-11-06", init_cash=100_000)
     r = run_backtest(p, {}, cfg)
     assert r.data["hfq_gap_rows"]["rows"] == 1942
     assert r.data["hfq_gap_rows"]["codes"] == sorted(codes)
+    led = r.data["hfq_gap_ledger"]
+    assert set(led) == {"buy_blocked", "frozen_position_days",
+                        "liquidated_hfq_gap", "liquidated_hfq_gap_value"}
+
+
+def test_hfq_gap_no_buy_and_no_phantom_layer_real_001914():
+    """审计 B3-01 (a)(b) 核心：sz.001914 的 2018 缺口期不得开仓，故不可能有幻影层。
+
+    真实数据：2018 全年 hfq 缺失（243 行），2019-01-02 起 hfq = 原始价 × 6.4111。
+    修复前缺口按因子 1 填充，缺口期买入的 nhq 在 2019-01-02 被真实因子放大 6.41 倍，
+    市值凭空暴涨，退出时变成真金白银。
+    修复后：缺口期买入被 hfq_gap 拦下（dropped 记录），持仓为零，净值不跳；
+    缺口外（2019-01-02）正常买入时 nhq = 金额 / (hfq_open×(1+滑点))，book 与真实因子一致。
+    """
+    p = load_panel("2018-01-02", "2019-06-28", codes=["sz.001914"])
+    j = 0
+    n_gap = int(p.hfq_gap[:, j].sum())
+    assert n_gap == 243, f"2018 缺口行数应 243，实际 {n_gap}"
+
+    # 2018-06-01 信号建仓 → 次日（缺口内）必须拒单
+    cfg = Config(start=p.dates[0], end=p.dates[-1], init_cash=1_000_000,
+                 max_positions=1, max_weight=1.0)
+    r = run_backtest(p, {"2018-06-01": {"sz.001914": 1.0}}, cfg)
+    assert r.trades.empty, f"缺口期不应成交，却成交 {len(r.trades)} 笔：\n{r.trades}"
+    assert not r.positions.shape[0], "缺口期不应有持仓"
+    buy_drop = r.dropped[r.dropped["side"] == "buy"]
+    assert len(buy_drop) == 1 and buy_drop.iloc[0]["reason"] == "hfq_gap"
+    assert r.data["hfq_gap_ledger"]["buy_blocked"] >= 1
+    assert r.nav["equity"].nunique() == 1, "未建仓时净值必须恒定，不许因缺口估值跳变"
+
+    # 缺口外（2019-01-02）建仓 → 按真实因子 6.41 折算，book 不含幻影层
+    d0 = "2019-01-03"
+    buy_at = p.dates[p.dates.index(d0) + 1]
+    r2 = run_backtest(p, {d0: {"sz.001914": 1.0}}, cfg)
+    buy = r2.trades[r2.trades["side"] == "buy"].iloc[0]
+    assert buy["date"] == buy_at
+    i = p.dates.index(buy_at)
+    raw_px = float(p.open_raw[i, j])
+    hfq_px = float(p.open_hfq[i, j])
+    assert hfq_px / raw_px == pytest.approx(6.4111, rel=1e-3), "缺口后因子应为 6.4111"
+    # 买入当日市值 = 成交金额/(1+滑点) × (hfq_close/hfq_open)
+    #   —— 只含当日涨跌，不含因子倍数；幻影层会让它凭空多出 6.41 倍
+    nhq_expect = buy["amount"] / (hfq_px * 1.001)
+    pos = r2.positions[r2.positions["date"] == buy_at].iloc[0]
+    value_expect = nhq_expect * float(p.close_hfq[i, j])
+    assert pos["value"] == pytest.approx(value_expect, rel=1e-9), (
+        f"买入当日市值 {pos['value']:.2f} 应等于 nhq×hfq_close={value_expect:.2f}")
+    ratio = pos["value"] / (buy["amount"] / 1.001)
+    assert 0.8 < ratio < 1.2, (
+        f"买入当日市值/成交金额 = {ratio:.4f}，超出当日涨跌范围 —— 幻影层又回来了")
+
+    # 每个交易日权益都不得出现"单日 >20% 跳变"（幻影层的特征）
+    nav = r2.nav.set_index("date")["equity"]
+    ret = nav.pct_change().dropna().abs()
+    assert ret.max() < 0.20, f"净值单日跳变 {ret.max():.2%}，疑似缺口估值断层"
+
+    # 缺口外退出：book 必须与「真实股数 × 真实因子换算」对拍（误差 ≤ 1e-9 相对）
+    d1 = "2019-05-30"
+    sell_at = p.dates[p.dates.index(d1) + 1]
+    r3 = run_backtest(p, {d0: {"sz.001914": 1.0}, d1: {"sz.001914": 0.0}}, cfg)
+    sell = r3.trades[r3.trades["side"] == "sell"].iloc[0]
+    assert sell["date"] == sell_at
+    k = p.dates.index(sell_at)
+    hfq_sell = float(p.open_hfq[k, j])
+    factor_sell = hfq_sell / float(p.open_raw[k, j])
+    assert factor_sell == pytest.approx(6.4111, rel=1e-2)
+    # book = 真实股数 × 买入日原始价 × (卖出日 hfq / 买入日 hfq)，即分红再投层计入后的市值
+    book_expect = buy["shares"] * raw_px * (hfq_sell / hfq_px)
+    assert sell["book"] == pytest.approx(book_expect, rel=1e-9), (
+        f"退出 book {sell['book']:.2f} 与『真实股数×真实因子换算』{book_expect:.2f} 不符")
+
+
+def test_hfq_gap_freezes_held_position():
+    """审计 B3-01 (2)：已持仓股进入 hfq 缺口段 → 禁卖、估值冻结在缺口前最后有效 hfq 价。"""
+    dates = ["2020-01-02", "2020-01-03", "2020-01-06", "2020-01-07", "2020-01-08"]
+    codes = ["sh.600000"]
+    raw = [[10.0], [10.2], [10.4], [10.6], [10.8]]
+    hfq = [[1000.0], [1020.0], [np.nan], [np.nan], [1080.0]]   # 第 3~4 日缺口
+    gap = [[False], [False], [True], [True], [False]]
+    p = Panel(dates=dates, codes=codes,
+              open_hfq=np.array(hfq), close_hfq=np.array(hfq),
+              open_raw=np.array(raw), close_raw=np.array(raw),
+              blocked_buy=np.zeros((5, 1), bool), blocked_sell=np.zeros((5, 1), bool),
+              suspended=np.zeros((5, 1), bool), hfq_gap=np.array(gap))
+    cfg = Config(start=dates[0], end=dates[-1], init_cash=100_000,
+                 max_positions=1, max_weight=1.0)
+    # 第 2 日起每天收盘都给清仓信号（引擎不保留未成交订单，必须逐日重发）：
+    #   第 3、4 日（缺口）→ 卖不出，记 hfq_gap；第 5 日（缺口结束）→ 成交
+    sig = {dates[0]: {"sh.600000": 1.0}}
+    for d in dates[1:4]:
+        sig[d] = {"sh.600000": 0.0}
+    r = run_backtest(p, sig, cfg)
+
+    sells = r.trades[r.trades["side"] == "sell"]
+    assert len(sells) == 1, f"应有 1 笔卖出，实际 {len(sells)} 笔：\n{r.trades}"
+    assert sells.iloc[0]["date"] == dates[4], "缺口期内不许卖出，须等缺口结束后才成交"
+    drops = r.dropped[(r.dropped["side"] == "sell") & (r.dropped["reason"] == "hfq_gap")]
+    assert len(drops) == 2, f"缺口期应记 2 笔 hfq_gap 废单，实际 {len(drops)} 笔"
+
+    nav = r.nav.set_index("date")["equity"]
+    # 缺口两天估值冻结：净值只随现金（无变化）与冻结价变化 → 与缺口前一日完全相等
+    assert nav.loc[dates[2]] == pytest.approx(nav.loc[dates[1]], abs=1e-9), (
+        f"缺口日净值应冻结在 {nav.loc[dates[1]]:.6f}，实际 {nav.loc[dates[2]]:.6f}")
+    assert nav.loc[dates[3]] == pytest.approx(nav.loc[dates[1]], abs=1e-9)
+    # 台账：持仓冻结天数 = 2
+    assert r.data["hfq_gap_ledger"]["frozen_position_days"] == 2
+
+
+def test_hfq_gap_to_end_liquidated_at_last_valid_hfq():
+    """审计 B3-01 (2) 后半：缺口延续到数据末端 → 按最后有效 hfq 价 ×(1−滑点) 清算并落台账。"""
+    dates = ["2020-01-02", "2020-01-03", "2020-01-06", "2020-01-07"]
+    codes = ["sh.600000"]
+    raw = [[10.0], [10.2], [10.4], [10.6]]        # 原始价一直有
+    hfq = [[1000.0], [1020.0], [np.nan], [np.nan]]  # hfq 从第 3 日起彻底断供
+    gap = [[False], [False], [True], [True]]
+    p = Panel(dates=dates, codes=codes,
+              open_hfq=np.array(hfq), close_hfq=np.array(hfq),
+              open_raw=np.array(raw), close_raw=np.array(raw),
+              blocked_buy=np.zeros((4, 1), bool), blocked_sell=np.zeros((4, 1), bool),
+              suspended=np.zeros((4, 1), bool), hfq_gap=np.array(gap))
+    cfg = Config(start=dates[0], end=dates[-1], init_cash=100_000,
+                 max_positions=1, max_weight=1.0)
+    r = run_backtest(p, {dates[0]: {"sh.600000": 1.0}}, cfg)
+
+    liq = r.trades[r.trades["side"] == "liquidate"]
+    assert len(liq) == 1, f"缺口延续到末端应有 1 笔清算，实际 {len(liq)} 笔：\n{r.trades}"
+    row = liq.iloc[0]
+    assert row["date"] == dates[1], f"清算应在最后一个有效 hfq 日 {dates[1]}，实际 {row['date']}"
+    assert row["reason"] == "hfq_gap"
+    # 清算价按**最后有效 hfq** 折算（原始价 10.2 × 0.999），不是缺口期原始价
+    assert row["price"] == pytest.approx(10.2 * 0.999)
+    # book = nhq × hfq_last，等价于「真实股数 × 买入当日原始价」（因子被 hfq 口径抵消），
+    # 即买入当日的真实市值 —— 不含任何幻影层
+    assert row["book"] == pytest.approx(row["shares"] * 10.2, rel=1e-9), (
+        f"清算 book 应按 hfq 价计，实际 {row['book']:.2f}")
+    led = r.data["hfq_gap_ledger"]
+    assert led["liquidated_hfq_gap"] == 1
+    assert led["liquidated_hfq_gap_value"] == pytest.approx(row["book"])
+    last = r.nav.iloc[-1]
+    assert last["equity"] == pytest.approx(last["cash"]), "清算后权益必须全部是现金"
+
+
+def test_load_ipo_dates_missing_db_raises(tmp_path):
+    """审计 B3-01 4(c)：stocks.ipoDate 读不到必须**显式停工**，不许静默退回 listed_days。"""
+    from src.backtest import _load_ipo_dates
+    with pytest.raises(RuntimeError, match="stocks.ipoDate"):
+        _load_ipo_dates(["sh.600000"], db=tmp_path / "missing.db")
+
+
+def test_load_ipo_dates_missing_table_raises(tmp_path):
+    """同上：库在但表不在（或读失败）也必须停工。"""
+    from src.backtest import _load_ipo_dates
+    db = tmp_path / "empty.db"
+    db.write_bytes(b"")
+    with pytest.raises(RuntimeError, match="stocks.ipoDate"):
+        _load_ipo_dates(["sh.600000"], db=db)
 
 
 # ---------------------------------------------------------------- 5. 退市清算（R4）

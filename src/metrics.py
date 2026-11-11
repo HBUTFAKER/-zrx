@@ -312,5 +312,9 @@ def format_card(m: dict) -> str:
     lines.append("------------- 样本外(2022起) -------------")
     lines.append(f"  年化 {pct(o['ann_return'])} | 波动 {pct(o['ann_vol'])} | "
                  f"回撤 {pct(o['mdd'])} | 夏普 {num(o['sharpe'])}")
+    lines.append("----------------------------------------")
+    # 审计 B3-02：指标卡最容易被截图传播，必须自带边界声明，防止被当成 alpha 证据
+    lines.append("  注：自检脚手架结果，非策略有效性/alpha 证据；")
+    lines.append("      超额受整手倾斜、seed 敏感度、可交易性过滤影响（见 result.json.extra.validity_note）")
     lines.append("========================================")
     return "\n".join(lines)
