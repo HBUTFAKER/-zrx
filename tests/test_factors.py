@@ -622,7 +622,7 @@ def test_validity_note_is_generated_from_stats():
         # B7-01：现金不再取单因子，必须传跨因子分布
         cash_dist={"available": True, "n_factors": 9,
                    "median_pct_min": 0.0002, "median_pct_max": 0.325,
-                   "worst_factor": "momentum_20", "worst_cash_max_pct": 3.88,
+                   "worst_factor": "momentum_20", "worst_layer_median_pct": 3.88,
                    "n_factors_below_001pct": 7,
                    "factors_below_001pct": ["ep", "bp", "size", "size_real",
                                             "roe_ttm", "yoy_ni", "debt_ratio"]},
@@ -899,6 +899,11 @@ def test_size_cross_check_zero_and_double():
     doubled = size_cross_check(fd2, a, b, ends)
     assert doubled["median_abs"] == pytest.approx(1.0), "股本翻倍 → 市值差正好 100%"
     assert doubled["share_gt30pct"] == pytest.approx(1.0)
+    # B7-05：相对差 100% 对应倍数 2x，两个口径必须同时给，否则又会被读成"2 倍"
+    assert doubled["max_abs_pct"] == pytest.approx(100.0)
+    assert doubled["max_ratio_x"] == pytest.approx(2.0)
+    assert doubled["min_ratio_x"] == pytest.approx(2.0)
+    assert same["max_ratio_x"] == pytest.approx(1.0), "两口径一致时倍数必须是 1x"
 
 
 # ---------------------------------------------------------------- 11. 审计-B6 四项
@@ -957,14 +962,17 @@ def test_lot_residual_reports_cash_median_not_just_claim(tmp_path):
     args = argparse.Namespace(cash=1e6, seed=42, layers=5, neutralize_method="demean")
     rep = build_report(fd, {"rank": fmat}, args)
     lot = rep["segments"]["dev"]["rank"]["lot_residual"]
-    assert {"cash_median_pct", "cash_max_pct", "cash_p95_pct"} <= set(lot), \
+    assert {"cash_median_pct", "max_layer_median_pct", "cash_p95_pct"} <= set(lot), \
         "现金指标必须同时给中位/95 分位/最大，只报 min-max 才会写出失实的「<0.01%」"
-    assert lot["cash_max_pct"] >= lot["cash_median_pct"] >= 0
+    assert "cash_max_pct" not in lot, \
+        "新裁决1：已改名 max_layer_median_pct —— 旧名说的是「最大」，实为层间最大中位数"
+    assert "layer_cash_pct" in lot, "单期极值的真出处必须在，否则改名等于藏信息"
+    assert lot["max_layer_median_pct"] >= lot["cash_median_pct"] >= 0
     assert "0.01% 以下" not in rep["validity_note"]
     cd = rep["cash_residual_distribution"]
     assert cd["available"] and cd["n_factors"] == 1, \
         "现金分布必须覆盖全部因子（本测试只跑一个因子，故 n_factors==1）"
-    assert str(cd["worst_cash_max_pct"]) in rep["validity_note"], \
+    assert str(cd["worst_layer_median_pct"]) in rep["validity_note"], \
         "免责里的现金数字必须与产物字段一致（动态生成）"
     assert "按因子看" in rep["validity_note"], \
         "B7-01：必须写明按因子看，不许拿单个因子代表全体"
@@ -989,11 +997,11 @@ def test_cash_distribution_spans_all_factors_not_first():
     seg = {
         "_meta": {"start": "2025-01-02"},
         "momentum_20": {"lot_residual": {"available": True, "cash_median_pct": 0.325,
-                                        "cash_p95_pct": 1.2402, "cash_max_pct": 1.4542}},
+                                        "cash_p95_pct": 1.2402, "max_layer_median_pct": 1.4542}},
         "bp": {"lot_residual": {"available": True, "cash_median_pct": 0.0004,
-                                "cash_p95_pct": 0.0006, "cash_max_pct": 0.0007}},
+                                "cash_p95_pct": 0.0006, "max_layer_median_pct": 0.0007}},
         "size": {"lot_residual": {"available": True, "cash_median_pct": 0.0003,
-                                  "cash_p95_pct": 0.0005, "cash_max_pct": 0.0005}},
+                                  "cash_p95_pct": 0.0005, "max_layer_median_pct": 0.0005}},
         "rank_unavailable": {"lot_residual": {"available": False}},
     }
     cd = cash_residual_distribution(seg)
@@ -1001,7 +1009,7 @@ def test_cash_distribution_spans_all_factors_not_first():
     assert cd["median_pct_min"] == 0.0003 and cd["median_pct_max"] == 0.325, \
         "必须给跨因子范围，不是单因子的一个数"
     assert cd["worst_factor"] == "momentum_20"
-    assert cd["worst_cash_max_pct"] == 1.4542
+    assert cd["worst_layer_median_pct"] == 1.4542
     assert cd["n_factors_below_001pct"] == 2
     assert "_meta" not in cd["by_factor"]
 

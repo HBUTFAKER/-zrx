@@ -43,11 +43,20 @@ dev 末截面 2025-10-31 的窗口是 2025-11-03 open → 2025-12-01 open，越�
 时点纪律：财报一律用**公告日** `pubDate`（缺失回退 `pubDate_est`）对齐，
 **绝不用 statDate**。T 日因子值 = 公告日 ≤ T 的最新一期；实现上先按公告日 as-of
 铺成逐日矩阵，再过 `_shift1`，等于"只用 ≤ T-1 已公告的财报"。
-`pubDate` 缺 17,199 行（9.79%），这些行的 `pubdate_src == "deadline_est"`，是用
-法定披露截止日推算的时点。**方向是滞后不是前视**：截止日（一季报 04-30 / 半年报
-08-31 / 三季报 10-31 / 年报次年 04-30）必然 ≥ 真实披露日，只可能晚知道、不可能预知
-未来；代价是这批期数晚一到两周才进截面，属**时点噪声**。审计-B7 用巨潮对照 50 例
-复核：0 例提前、平均滞后 8.8 天。如实写进产物 `data.fundamentals.pubdate_src`。
+`pubDate` 缺 17,199 行，**分母是 rows_in = 175,734（有报告期的原始行）→ 9.79%**；
+纯度为"有报告期"的行里再剔无公告日的行，16,242 行回退，
+**分母是 rows_with_period = 170,636 → 9.5185%**。两个比例分母不同，不可混用。
+
+`pubDate_est` 字段结构（审计-B7-06 实测，直接影响怎么读"滞后"）：
+est 覆盖 175,734 行**全量**；pubDate 有值的 158,535 行里 **est 与 pubDate 100% 相等**
+（该字段在 clean 阶段就是 `pubDate.fillna(截止日)`，有实测就直接抄）；est 相对 pubDate
+的**独有值恰好等于那 17,199 个缺失行**。即 est 是 pubDate 的超集补全字段，
+**残余时点误差只来自缺失行的截止日推算**，不来自有实测公告日的行。
+
+方向**是滞后不是前视**：截止日（一季报 04-30 / 半年报 08-31 / 三季报 10-31 /
+年报次年 04-30）必然 ≥ 真实披露日，只可能晚知道、不可能预知未来；代价是这批期数
+晚一到两周才进截面，属**时点噪声**。审计-B7 用巨潮对照 50 例复核：0 例提前、
+平均滞后 8.8 天。如实写进产物 `data.fundamentals.pubdate_src`。
 
 roe_ttm 不用 `roeAvg`：它是**区间累计**口径（Q1 是三个月、Q4 是全年），直接进截面会让
 因子值随季度季节性摆动。这里改成 `净利润TTM / 期末股东权益`，TTM 由 4 个季度累计值
@@ -273,7 +282,9 @@ def prepare_fundamentals(fin: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     纯函数，不读盘，方便用反例直接测时点纪律。
 
     · **只用 pubDate / pubDate_est 当时间轴，statDate 绝不参与**；
-      17,199 行（9.79%）没有实际公告日，用法定披露截止日推算的 pubDate_est 顶，
+      17,199 行没有实际公告日（分母 rows_in=175,734 → 9.79%），用法定披露截止日
+      推算的 pubDate_est 顶；再剔掉真正没报告期的行后是 16,242 行
+      （分母 rows_with_period=170,636 → 9.5185%）。**两个分母不同，别混用**。
       这类行数如实计入返回的 stats，不隐藏。
     · roe_ttm 用 TTM 净利润 / 期末权益：q4 直接用年报，q1~q3 = 本期累计 + 上年年报 −
       上年同期累计。不用 roeAvg（区间累计口径，混季度会让因子值随季节摆动）。
@@ -1178,8 +1189,11 @@ def _fill_stats(result, sig: dict) -> dict:
       5.8%，其中大部分是这类）。这就是审计里"每层留 2~7% 残差"该被量化的那个数。
     · weight_dev  = ½Σ|实际权重 − 目标权重|（全并集，含买不到的），衡量整体偏离。
     · cash_pct    = 1 − (权益−现金)/权益，即没投出去的现金占比。
-      实测这个数极小（< 0.01%）：引擎按资金约束贪心成交，现金基本买空 ——
-      残差体现为"某些股票配少了"，不是"留了一笔现金"。三个数必须分开报，
+      **按因子差异很大，不许写成全称句**（审计-B7-03）：动量类层期中位
+      momentum_20 0.325% / momentum_60 0.2371%，其余 7 个因子 0.0002%~0.0008%
+      （最高 bp 0.0007%）。引擎按资金约束贪心成交，现金基本买空，残差主体是
+      "某些股票配少了"而不是"留了一笔现金"；但动量类确实会留到千分之几，
+      说成"全部极小"会重犯 B6-01 的错。三个数必须分开报，
       否则又会出"标签对不上数字"（B5-02 的教训）。
     """
     if result is None or not len(result.nav):
@@ -1334,7 +1348,7 @@ def lot_residual_stats(layer_navs: list[pd.DataFrame | None],
         "weight_dev_max_pct": dev_hi,
         "layer_cash_pct": [f.get("cash_pct") for f in fills],
         "cash_min_pct": cash_lo,
-        "cash_max_pct": cash_hi,
+        "max_layer_median_pct": cash_hi,
         # 审计-B6-01：旧稿只报了 min/max 就说"未投入现金 <0.01%"，而实测单期最大
         # 到 3.88%。补中位与全样本分位，让"到底留了多少现金"能被核对。
         "cash_median_pct": (round(float(np.median([f["cash_pct"] for f in fills
@@ -1361,8 +1375,10 @@ def cash_residual_distribution(seg_dev: dict) -> dict:
 
     所以这里必须给跨因子的**范围**，并点出最高的是哪个因子。
 
-    口径提醒：`cash_max_pct` 是「5 层各自的期中位现金」里的最大值，**不是单期最大
-    值**；单期极值看 lot_residual.layer_cash_pct（5 个数的明细）。
+    口径提醒：`max_layer_median_pct`（**原 cash_max_pct，审计-B7 改名**）是「5 层各自的
+    期中位现金」里的最大值，**不是单期最大值**；单期极值看
+    lot_residual.layer_cash_pct（5 个数的明细）。旧名把"层间最大中位数"说成"最大"，
+    下游一律按单期极值解读，改名前已如实标注。
     """
     rows = {}
     for k, v in seg_dev.items():
@@ -1372,20 +1388,21 @@ def cash_residual_distribution(seg_dev: dict) -> dict:
         if not lr.get("available"):
             continue
         rows[k] = {c: lr.get(c) for c in
-                   ("cash_median_pct", "cash_p95_pct", "cash_max_pct")}
+                   ("cash_median_pct", "cash_p95_pct", "max_layer_median_pct")}
     if not rows:
         return {"available": False, "reason": "no_lot_residual"}
 
     meds = [r["cash_median_pct"] for r in rows.values()
             if r["cash_median_pct"] is not None]
-    maxs = [r["cash_max_pct"] for r in rows.values() if r["cash_max_pct"] is not None]
+    maxs = [r["max_layer_median_pct"] for r in rows.values()
+            if r["max_layer_median_pct"] is not None]
     if not maxs:
         return {"available": False, "reason": "no_cash_pct"}
 
-    worst = max(rows, key=lambda k: rows[k]["cash_max_pct"] if
-                rows[k]["cash_max_pct"] is not None else -1.0)
+    worst = max(rows, key=lambda k: rows[k]["max_layer_median_pct"] if
+                rows[k]["max_layer_median_pct"] is not None else -1.0)
     tiny = sorted(k for k, r in rows.items()
-                  if (r["cash_max_pct"] or 0.0) < 0.01)
+                  if (r["max_layer_median_pct"] or 0.0) < 0.01)
     return {
         "available": True,
         "n_factors": len(rows),
@@ -1394,13 +1411,14 @@ def cash_residual_distribution(seg_dev: dict) -> dict:
         "max_pct_min": round(float(min(maxs)), 6),
         "max_pct_max": round(float(max(maxs)), 6),
         "worst_factor": worst,
-        "worst_cash_max_pct": round(float(rows[worst]["cash_max_pct"]), 6),
+        "worst_layer_median_pct": round(float(rows[worst]["max_layer_median_pct"]), 6),
         "n_factors_below_001pct": len(tiny),
         "factors_below_001pct": tiny,
         "by_factor": rows,
         "definition": "未投入现金 = 1−(权益−现金)/权益，各期取中位；此处跨全部因子取"
-                      "范围并点名最高因子。cash_max_pct 是 5 层「期中位数」的最大值，"
-                      "不是单期最大值（单期极值见 lot_residual.layer_cash_pct）",
+                      "范围并点名最高因子。max_layer_median_pct（原 cash_max_pct）是"
+                      "5 层「期中位数」的最大值，不是单期最大值"
+                      "（单期极值见 lot_residual.layer_cash_pct）",
     }
 
 
@@ -1602,8 +1620,10 @@ def _readings(dev: dict, ho: dict, neu: dict | None = None,
                     if isinstance(_both, (int, float)) else
                     "差异集中在少数跳变日，不是全局重排。")
                 out.append(
-                    f"size 两口径：月度截面市值差 中位 {_f(dev_cmp['median_abs'])}、"
-                    f"p90 {_f(dev_cmp['p90_abs'])}、最大 {_f(dev_cmp['max_abs'])}"
+                    f"size 两口径：月度截面相对差 中位 {_f(dev_cmp['median_abs'])}、"
+                    f"p90 {_f(dev_cmp['p90_abs'])}、最大 "
+                    f"{_f(dev_cmp.get('max_abs_pct'), '.2f')}%"
+                    f"（{_f(dev_cmp.get('max_ratio_x'), '.2f')}x 倍）"
                     + (f"，差 <5% 的点占 {_f(1 - _gt5, '.2%')}" if isinstance(_gt5, (int, float)) else "")
                     + f"，超过 30% 的占 {_f(dev_cmp['share_gt30pct'], '.2%')}；"
                     f"IC 推算 {_ic_s} vs 真实 {_f(_real_ic, '+.4f')}。" + _tail)
@@ -1628,8 +1648,14 @@ def _git_meta() -> dict:
     旧版只写一个 `git_commit`，而产物通常在提交**之前**生成 —— 于是产物里的哈希
     永远指向上一笔代码，"这份报告到底是哪版代码算的"无法回答。现在拆成：
       · code_commit     生成时代码所在的 HEAD；
-      · code_dirty      生成时工作区是否有未提交改动（有改动就该标 True）；
+      · code_dirty      生成时**代码**（src/ tests/）是否有未提交改动；
+      · worktree_dirty  整个工作区是否有未提交改动（含别人未提交的文档）；
       · generated_at    生成时刻。
+
+    `code_dirty` 只看 src/ 与 tests/（审计-B7-04）：仓库里长期有总工未提交的
+    AGENTS.md / docs/，按全仓库算会让 code_dirty 永远为 True，"这份产物是哪版代码
+    算的"就永远说不清。全量状态另出 `worktree_dirty` + `worktree_other_files`，
+    不隐瞒。
     `write_report()` 还会再补一个 written_at，落盘时刻与生成时刻分开记。
     """
     commit = _git_commit()
@@ -1641,12 +1667,19 @@ def _git_meta() -> dict:
                               "status", "--porcelain"], cwd=ROOT, check=True,
                              capture_output=True, text=True).stdout
         lines = [ln for ln in out.splitlines() if ln.strip()]
-        dirty = bool(lines)
-        dirty_files = [ln[3:].strip() for ln in lines][:20]
+        paths = [ln[3:].strip().strip('"') for ln in lines]
+        # 只把 src/ tests/ 算进 code_dirty；文档类改动单列，不参与"代码是否干净"的判断
+        code_files = [p for p in paths if p.startswith(("src/", "tests/"))]
+        other_files = [p for p in paths if not p.startswith(("src/", "tests/"))][:20]
+        dirty = bool(code_files)
+        dirty_files = code_files[:20]
+        worktree_dirty = bool(paths)
     except Exception:  # noqa: BLE001
-        dirty, dirty_files = None, []
+        dirty, dirty_files, worktree_dirty, other_files = None, [], None, []
     return {"code_commit": commit, "git_commit": commit, "code_dirty": dirty,
             "code_dirty_files": dirty_files,
+            "worktree_dirty": worktree_dirty,
+            "worktree_other_files": other_files,
             "generated_at": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S")}
 
 
@@ -1670,15 +1703,24 @@ def size_cross_check(fd: FactorData, f_old: np.ndarray, f_new: np.ndarray,
         return {"available": False, "reason": "no_overlap"}
     d = np.concatenate(diffs)
     a = np.abs(d)
+    # B7-05：max_abs 是**相对差** |比值−1|，不是倍数。2.1585 对应 3.16x，
+    # 旧汇报写成「最大 2.16 倍」把相对差当成了倍数（差 2.16x 与 3.16x 两种读法）。
+    # 这里把两种口径都落进产物，下游不用再换算。
     return {
         "available": True, "n_points": int(n_pts), "n_cross_sections": len(ends),
         "median_abs": round(float(np.median(a)), 8),
         "p90_abs": round(float(np.quantile(a, 0.90)), 8),
         "p99_abs": round(float(np.quantile(a, 0.99)), 8),
         "max_abs": round(float(a.max()), 8),
+        "max_abs_pct": round(float(a.max() * 100.0), 4),
+        "max_abs_ratio_x": round(float(1.0 + a.max()), 4),
+        "max_ratio_x": round(float(1.0 + float(d.max())), 4),
+        "min_ratio_x": round(float(1.0 + float(d.min())), 4),
         "share_gt5pct": round(float((a > 0.05).mean()), 8),
         "share_gt30pct": round(float((a > 0.30).mean()), 8),
-        "definition": "月度截面 |真实股本市值/推算股本市值 − 1|，两口径都取 T-1",
+        "definition": "月度截面比值 = 真实股本市值/推算股本市值（两口径都取 T-1）；"
+                      "max_abs = |比值−1| 即相对差，倍数 = 1+相对差。"
+                      "max_abs=2.1585 → 相对差 215.85%、倍数 3.16x（**不是 2.16 倍**）",
     }
 
 
@@ -1778,7 +1820,10 @@ def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = Non
             f"③ size 口径：本报告同时给 `size`（换手率推算）与 `size_real`（真实股本）两列，"
             f"差异分布见 size_compare（月度截面中位 "
             f"{(size_cmp or {}).get('dev', {}).get('median_abs', float('nan')):.4f}、"
-            f"p90 {(size_cmp or {}).get('dev', {}).get('p90_abs', float('nan')):.4f}）。"
+            f"p90 {(size_cmp or {}).get('dev', {}).get('p90_abs', float('nan')):.4f}、"
+            f"最大相对差 {_f((size_cmp or {}).get('dev', {}).get('max_abs_pct'), '.2f')}%"
+            f" 即 {_f((size_cmp or {}).get('dev', {}).get('max_ratio_x'), '.2f')}x 倍 ——"
+            f"相对差与倍数不是同一个数，旧稿「最大 2.16 倍」是把相对差当倍数）。"
             f"推算口径的跳变实测 {size_jump.get('rows')} 行 / {size_jump.get('codes')} 只，"
             f"其中 {size_jump.get('month_end_rows')} 行落在月末 "
             f"{size_jump.get('month_end_window_days')} 日窗口内"
@@ -1829,7 +1874,7 @@ def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = Non
             cash_s = (f"**未投入现金按因子看**（{cash['n_factors']} 个因子）：各层期中位 "
                       f"{cash['median_pct_min']}%~{cash['median_pct_max']}%，"
                       f"最高是 `{cash['worst_factor']}`（层间最大中位 "
-                      f"{cash['worst_cash_max_pct']}%）；另有 "
+                      f"{cash['worst_layer_median_pct']}%）；另有 "
                       f"{cash['n_factors_below_001pct']} 个因子全期 <0.01%。"
                       f"取单一因子代表全体两个方向都会错（旧稿把它说成几乎为零，"
                       f"被动量类推翻；改完又拿动量类的峰值代表全体）—— 故给全因子范围。")
@@ -2134,7 +2179,7 @@ def print_summary(report: dict) -> None:
         if cd.get("available"):
             print(f"未投入现金（全部 {cd['n_factors']} 个因子）：层期中位 "
                   f"{cd['median_pct_min']}%~{cd['median_pct_max']}%，最高 "
-                  f"{cd['worst_factor']} {cd['worst_cash_max_pct']}%；"
+                  f"{cd['worst_factor']} {cd['worst_layer_median_pct']}%；"
                   f"{cd['n_factors_below_001pct']} 个因子全期 <0.01%"
                   f"（口径：层间最大中位数，非单期极值）")
 
