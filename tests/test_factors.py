@@ -29,18 +29,22 @@ sys.path.insert(0, str(ROOT))
 
 from src.backtest import Config, Costs, Panel  # noqa: E402
 from src.factors import (DEV_END, HOLDOUT_START, MIN_LISTED_DAYS,  # noqa: E402
-                         VALIDITY_NOTE, FactorData, _layer_shape, bp,
-                         build_report, compute_factors, cross_section_mask,
-                         data_quality_stats, ep, evaluate_segment,
-                         forward_returns, ic_periods, ic_summary,
-                         load_factor_data, momentum, month_end_indices, rank_ic,
-                         segment_bounds, size, split_layers)
+                         MIN_GROUP_SIZE, FactorData, _layer_shape, align_by_pubdate,
+                         bp, build_report, build_validity_note, compute_factors,
+                         cross_section_mask, data_quality_stats, ep,
+                         evaluate_segment, forward_returns, ic_periods, ic_summary,
+                         load_factor_data, momentum, month_end_indices,
+                         neutralize_matrix, prepare_fundamentals, rank_ic,
+                         size_cross_check,
+                         segment_bounds, share_float_matrix, size, size_real,
+                         split_layers)
 
 
 # ---------------------------------------------------------------- 工具
 def make_factor_data(dates, codes, open_hfq, close_hfq, close_raw=None,
                      volume=None, turn=None, pe=None, pb=None, listed=None,
-                     is_st=None) -> FactorData:
+                     is_st=None, roe_ttm=None, yoy_ni=None, debt_ratio=None,
+                     float_shares=None, industry_gid=None) -> FactorData:
     """合成 FactorData：价格矩阵显式给，其余列按常理填。"""
     o = np.asarray(open_hfq, dtype="float64")
     c = np.asarray(close_hfq, dtype="float64")
@@ -61,6 +65,10 @@ def make_factor_data(dates, codes, open_hfq, close_hfq, close_raw=None,
     st = np.zeros(shape) if is_st is None else np.asarray(is_st, dtype="float64")
     return FactorData(panel=panel, pe_ttm=pe_, pb_mrq=pb_, volume=vol, turn=trn,
                       is_st=st, listed_days=ld,
+                      roe_ttm=roe_ttm, yoy_ni=yoy_ni, debt_ratio=debt_ratio,
+                      float_shares=float_shares,
+                      industry_gid=(None if industry_gid is None
+                                    else np.asarray(industry_gid, dtype="int16")),
                       source={"start": dates[0], "end": dates[-1],
                               "dates": n_d, "codes": n_c})
 
@@ -594,17 +602,36 @@ def test_size_jump_stats_reproducible(tmp_path):
     assert st["scope"]["codes"] == 2
 
 
-def test_validity_note_carries_current_numbers():
-    """B5-02：失效的旧数字必须从 VALIDITY_NOTE 里消失，新的实测数字必须在。
+def test_validity_note_is_generated_from_stats():
+    """B6-04：免责里的数字必须来自实测产物，不许写死。
 
-    "2~7% 残差"、"0.2~0.3pp/月" 都是审计-B5 指出与实测不符的表述；
-    "2.25pp" 必须保留但必须带"标签错误"的更正说明，否则下次又会被当成结论引用。
+    旧断言直接读模块常量 VALIDITY_NOTE，等于把 8,628 / <0.01% 这些数字钉死在代码里 ——
+    改了默认值产物照样说旧话（审计-B6-01/04 的原话）。改成对构造函数断言：
+    ① 传什么数字就出现什么数字；② 不传就不许出现任何具体数字；
+    ③ 失效的旧表述（2~7%、0.2~0.3pp、<0.01%）永远不许再出现。
     """
-    assert "2~7%" not in VALIDITY_NOTE, "旧的「每层留 2~7% 残差」还在"
-    assert "0.2~0.3pp" not in VALIDITY_NOTE, "旧的「差约 0.2~0.3pp/月」还在"
-    assert "8,628" in VALIDITY_NOTE and "3,693" in VALIDITY_NOTE, "跳变量化未写进免责"
-    assert "标签错误" in VALIDITY_NOTE, "2.25pp 的更正说明丢了"
-    assert "自相关" in VALIDITY_NOTE, "t 值高估的免责丢了"
+    note = build_validity_note(
+        size_jump={"rows": 8628, "codes": 3693, "month_end_rows": 2788,
+                   "month_end_window_days": 7,
+                   "examples": [{"code": "sz.001289", "date": "2025-01-24",
+                                 "share_ratio": 14.588}]},
+        lot={"available": True, "mean_abs_pp": 0.12, "median_abs_pp": 0.07,
+             "p90_abs_pp": 0.29, "signed_ann_pp": -0.42,
+             "partial_gap_min_pct": 0.70, "partial_gap_max_pct": 2.27,
+             "cash_median_pct": 0.01, "cash_max_pct": 3.88},
+        turn_missing={"rate": 0.007131, "missing": 68953, "worst_year": "2018",
+                      "all_suspended": True, "by_year": {"2018": {"rate": 0.046586}}},
+        size_cmp={"dev": {"median_abs": 0.0001, "p90_abs": 0.0003}})
+    assert "8628" in note and "3693" in note and "2788" in note, "实测跳变量没进免责"
+    assert "3.88" in note, "未投入现金的最大值必须按实测写（B6-01 的 0.01% 已被证伪）"
+    assert "sz.001289" in note and "14.588" in note
+    assert "自相关" in note, "t 值高估的免责丢了"
+    assert "2~7%" not in note and "0.2~0.3pp" not in note and "<0.01%" not in note, \
+        "旧的失实表述不许回流"
+
+    bare = build_validity_note()
+    for token in ("8628", "8,628", "3.88", "0.12pp"):
+        assert token not in bare, f"未传统计量时不许出现具体数字：{token}"
 
 
 def test_ic_summary_docstring_warns_autocorrelation():
@@ -612,3 +639,329 @@ def test_ic_summary_docstring_warns_autocorrelation():
     doc = ic_summary.__doc__ or ""
     assert "自相关" in doc and "高估" in doc
     assert "Newey" in doc or "bootstrap" in doc, "免责要给出替代做法，不然只是免责不改正"
+
+
+# ---------------------------------------------------------------- 7. 004B：公告日纪律
+def _fin_row(code, statDate, pubDate, np_, eq, debt=np.nan, yoy=np.nan, q=None):
+    return {"code": code, "statDate": statDate, "pubDate": pubDate,
+            "pubDate_est": pubDate, "pubdate_src": "announce",
+            "quarter": q if q is not None else float(statDate[5:7]) / 3,
+            "netProfit": np_, "total_equity": eq, "debt_ratio": debt,
+            "YOYNI": yoy, "epsTTM": np.nan}
+
+
+def test_pubdate_rule_report_period_before_announcement():
+    """核心反例：报告期早、公告晚的财报，公告日之前**不得**进入因子值。
+
+    2019 年报（statDate 2019-12-31）到 2020-04-30 才公告。若实现拿 statDate 当时点，
+    2020-01-15 就已经"知道"全年业绩 —— 这是典型未来函数。这里用日期硬断言。
+    """
+    # 用 debt_ratio 做时间轴断言：它不需要 4 个季度也能算，能把"时点"与"TTM 口径"
+    # 两个问题分开验证（TTM 另有专门测试）
+    fin = pd.DataFrame([
+        _fin_row("sh.600000", "2019-09-30", "2019-10-30", np_=90.0, eq=1000.0, debt=60.0),
+        _fin_row("sh.600000", "2019-12-31", "2020-04-30", np_=120.0, eq=1100.0, debt=55.0),
+    ])
+    rec, stats = prepare_fundamentals(fin)
+    assert len(rec) == 2 and stats["pubdate_missing_rows"] == 0
+
+    dates = ["2019-10-29", "2019-10-30", "2020-01-15", "2020-04-29", "2020-04-30"]
+    m = align_by_pubdate(rec, dates, ["sh.600000"], "debt_ratio")
+    assert np.isnan(m[0, 0]), "公告日之前不该有任何值"
+    assert m[1, 0] == pytest.approx(60.0), "公告当日即生效（Q3）"
+    assert m[2, 0] == pytest.approx(60.0), \
+        "2020-01-15 必须仍是 Q3 —— 全年业绩还没公告，绝不能用 statDate 提前知道"
+    assert m[3, 0] == pytest.approx(60.0), "年报公告前一天仍是 Q3"
+    assert m[4, 0] == pytest.approx(55.0), "公告当日起切到年报"
+
+
+def test_pubdate_falls_back_to_estimate_and_is_counted():
+    """没有实际公告日时回退 pubDate_est，并在 stats 里如实计数（不许静默）。"""
+    fin = pd.DataFrame([
+        {"code": "sh.600000", "statDate": "2019-12-31", "pubDate": None,
+         "pubDate_est": "2020-04-30", "pubdate_src": "deadline_est", "quarter": 4.0,
+         "netProfit": 120.0, "total_equity": 1100.0, "debt_ratio": 60.0,
+         "YOYNI": 5.0, "epsTTM": np.nan},
+    ])
+    rec, stats = prepare_fundamentals(fin)
+    assert stats["pubdate_missing_rows"] == 1
+    assert stats["pubdate_missing_rate"] == pytest.approx(1.0)
+    m = align_by_pubdate(rec, ["2020-04-29", "2020-04-30"], ["sh.600000"], "roe_ttm")
+    assert np.isnan(m[0, 0]) and np.isfinite(m[1, 0])
+
+
+def test_ttm_net_profit_is_four_quarters_not_ytd():
+    """roe_ttm 必须用 TTM 净利润，不是累计值。
+
+    2019 Q1~Q4 累计 10/20/30/40，2020 Q1 累计 12。
+    TTM(2020Q1) = 12 + 40 − 10 = 42；若错用累计值会得到 12（差 3.5 倍）。
+    """
+    rows = [_fin_row("sh.600000", d, d, np_=v, eq=100.0, q=q)
+            for (d, v, q) in (("2019-03-31", 10.0, 1.0), ("2019-06-30", 20.0, 2.0),
+                              ("2019-09-30", 30.0, 3.0), ("2019-12-31", 40.0, 4.0))]
+    rows.append(_fin_row("sh.600000", "2020-03-31", "2020-04-30", np_=12.0, eq=100.0,
+                         q=1.0))
+    rec, _ = prepare_fundamentals(pd.DataFrame(rows))
+    m = align_by_pubdate(rec, ["2020-05-06"], ["sh.600000"], "roe_ttm")
+    assert m[0, 0] == pytest.approx(0.42), f"应为 TTM 42/100=0.42，实际 {m[0, 0]}"
+
+
+def test_fundamentals_missing_field_stops_work():
+    """缺财报字段必须抛 RuntimeError（停工上报），不许换字段顶替。"""
+    bad = pd.DataFrame([{"code": "sh.600000", "statDate": "2019-12-31",
+                         "pubDate": "2020-04-30", "pubDate_est": "2020-04-30",
+                         "quarter": 4.0, "netProfit": 1.0, "debt_ratio": 1.0,
+                         "YOYNI": 1.0}])           # 缺 total_equity
+    with pytest.raises(RuntimeError, match="停工上报"):
+        prepare_fundamentals(bad)
+
+
+# ---------------------------------------------------------------- 8. 004B：事件填充边界
+def test_share_float_matrix_event_boundaries(tmp_path):
+    """事件级股本的填充边界：事件前 NaN、事件当日生效、之后沿用、次一事件当日切换。"""
+    ev = pd.DataFrame({
+        "code": ["sh.600000"] * 3,
+        "event_date": pd.to_datetime(["2020-01-06", "2020-01-08", "2020-01-08"]),
+        "float_share_a": [100.0, np.nan, np.nan],
+        "float_share": [100.0, 200.0, 250.0],
+        "reason": ["首发限售股份上市", "增发A股上市", "增发A股上市"],
+    })
+    p = tmp_path / "share_events.parquet"
+    ev.to_parquet(p, index=False)
+    dates = ["2020-01-03", "2020-01-06", "2020-01-07", "2020-01-08", "2020-01-09"]
+    m, st = share_float_matrix(dates, ["sh.600000"], path=p)
+    col = m[:, 0]
+    assert np.isnan(col[0]), "首个事件之前没有股本 → NaN，不许拿 0 或猜"
+    assert col[1] == 100.0, "事件当日即生效"
+    assert col[2] == 100.0, "事件之间沿用前值"
+    assert col[3] == 250.0, "次日事件当日切换；同日多条取最后一条"
+    assert col[4] == 250.0
+    assert st["codes_coverage"] == 1.0
+
+
+def test_share_float_prefers_listed_a_share(tmp_path):
+    """float_share_a 优先（换手率的分母口径），缺失才回退 float_share。"""
+    ev = pd.DataFrame({
+        "code": ["sh.600000"] * 2,
+        "event_date": pd.to_datetime(["2020-01-06", "2020-01-08"]),
+        "float_share_a": [100.0, 300.0],
+        "float_share": [999.0, 999.0],
+        "reason": ["a", "b"],
+    })
+    p = tmp_path / "share_events.parquet"
+    ev.to_parquet(p, index=False)
+    m, _ = share_float_matrix(["2020-01-06", "2020-01-08"], ["sh.600000"], path=p)
+    assert m[0, 0] == 100.0 and m[1, 0] == 300.0, "不该用已流通股份（含 B/H 股口径）"
+
+
+def test_share_float_zero_a_share_falls_back(tmp_path):
+    """float_share_a=0 不算"有值"：实测 1,373 行如此，回退 float_share 别整行丢掉。
+
+    按"非缺失优先"取 0，这些事件会被 `value > 0` 过滤掉，等于该股一开始没有股本，
+    size_real 白空一段 —— 而 0 的语义是"A 股还没流通"，不是"股本为零"。
+    """
+    ev = pd.DataFrame({
+        "code": ["sh.600000"] * 2,
+        "event_date": pd.to_datetime(["2020-01-06", "2020-01-08"]),
+        "float_share_a": [0.0, 300.0],
+        "float_share": [200.0, 999.0],
+        "reason": ["仅B股", "A股上市"],
+    })
+    p = tmp_path / "share_events.parquet"
+    ev.to_parquet(p, index=False)
+    m, st = share_float_matrix(["2020-01-06", "2020-01-08"], ["sh.600000"], path=p)
+    assert m[0, 0] == 200.0, "a 股流通为 0 时要用已流通股份，不能当成缺失丢掉"
+    assert m[1, 0] == 300.0
+    assert st["events_rows"] == 2
+
+
+def test_size_real_equals_size_when_shares_consistent():
+    """两口径在股本等于推算值时**逐位相同**，差别只能来自股本来源。"""
+    n_d, n_c = 30, 4
+    dates = trade_days("2020-01-02", n_d)
+    codes = [f"sh.{600000 + j}" for j in range(n_c)]
+    rng = np.random.RandomState(3)
+    px = 10.0 * np.cumprod(1.0 + rng.normal(0, 0.01, (n_d, n_c)), axis=0)
+    vol = np.tile(np.array([1e6, 2e6, 3e6, 4e6]), (n_d, 1))
+    turn = vol / 1e8 * 100.0                      # 反推股本恒为 1e8
+    fd = make_factor_data(dates, codes, px, px, volume=vol, turn=turn,
+                          float_shares=np.full((n_d, n_c), 1e8))
+    a = size(fd.panel.close_raw, fd.volume, fd.turn)
+    b = size_real(fd.panel.close_raw, fd.float_shares)
+    assert np.allclose(a, b, equal_nan=True), "股本一致时两口径必须完全相同"
+
+
+def test_size_real_ignores_turn_rounding():
+    """turn 被舍入/异常污染时，真实股本口径不受影响（这正是换口径的收益之一）。"""
+    n_d, n_c = 10, 2
+    dates = trade_days("2020-01-02", n_d)
+    px = np.full((n_d, n_c), 10.0)
+    vol = np.full((n_d, n_c), 1e6)
+    turn = np.full((n_d, n_c), 1.0)
+    turn[5, 0] = 1.45                            # 低换手日的舍入放大（+45%）
+    fd = make_factor_data(dates, codes=["sh.600000", "sz.000001"], open_hfq=px,
+                          close_hfq=px, volume=vol, turn=turn,
+                          float_shares=np.full((n_d, n_c), 1e8))
+    a = size(fd.panel.close_raw, fd.volume, fd.turn)[:, 0]
+    b = size_real(fd.panel.close_raw, fd.float_shares)[:, 0]
+    # 因子都是 T-1 口径：turn[5] 的污染在 a[6] 上体现
+    assert a[6] < b[6] - 0.3, "推算口径被 turn 放大拉低了市值"
+    assert b[6] == pytest.approx(b[5]), "真实股本口径不受 turn 影响"
+
+
+# ---------------------------------------------------------------- 9. 004B：行业中性化
+def _two_group_panel():
+    """两个行业组各 6 只，因子 = 行业位移 + 组内差异。"""
+    n_d, per = 45, 6
+    dates = trade_days("2020-01-02", n_d)
+    codes = [f"sh.{600000 + j}" for j in range(2 * per)]
+    px = np.full((n_d, len(codes)), 10.0)
+    f = np.zeros((n_d, len(codes)))
+    f[:, :per] = 1.0 + np.arange(per) * 0.01      # 组 A 整体偏高
+    f[:, per:] = 0.0 + np.arange(per) * 0.01      # 组 B
+    gid = np.zeros((n_d, len(codes)), dtype="int16")
+    gid[:, per:] = 1
+    return dates, codes, px, f, gid
+
+
+def test_neutralize_removes_industry_level():
+    """demean 后每组的截面均值必须≈0，组间水平差被拿掉、组内排序保留。"""
+    dates, codes, px, f, gid = _two_group_panel()
+    fd = make_factor_data(dates, codes, px, px, industry_gid=gid)
+    ends = month_end_indices(dates)
+    out, st = neutralize_matrix(f, fd, ends, gid, method="demean")
+    assert st["n_cells_neutralized"] > 0
+    for i in ends:
+        ok = cross_section_mask(fd, i)
+        for g in (0, 1):
+            sel = ok & (gid[i] == g)
+            assert abs(out[i][sel].mean()) < 1e-12, "组均值没被减干净"
+    # 组内排序不变（单调变换）
+    i = ends[0]
+    a = f[i][:6]
+    b = out[i][:6]
+    assert np.all(np.argsort(a) == np.argsort(b)), "中性化不能改变组内排序"
+
+
+def test_neutralize_leaves_small_group_and_non_xsec_rows():
+    """组内样本 <min_group 不动；非截面日的行原样复制（不逐日中性化）。"""
+    dates, codes, px, f, gid = _two_group_panel()
+    gid = gid.copy()
+    gid[:, 11] = 7                                # 造一个只有 1 只的组
+    fd = make_factor_data(dates, codes, px, px, industry_gid=gid)
+    ends = month_end_indices(dates)
+    out, st = neutralize_matrix(f, fd, ends, gid, method="demean")
+    i = ends[0]
+    assert out[i][11] == f[i][11], "小组必须原样保留（减组均值等于减噪声本身）"
+    assert st["n_small_group_cells"] >= len(ends)
+    mid = ends[0] + 3                             # 非截面日
+    assert np.allclose(out[mid], f[mid], equal_nan=True), "非截面日不许改"
+
+
+def test_neutralize_zscore_unit_std():
+    """zscore 后组内标准差≈1。"""
+    dates, codes, px, f, gid = _two_group_panel()
+    fd = make_factor_data(dates, codes, px, px, industry_gid=gid)
+    ends = month_end_indices(dates)
+    out, _ = neutralize_matrix(f, fd, ends, gid, method="zscore")
+    i = ends[0]
+    ok = cross_section_mask(fd, i)
+    for g in (0, 1):
+        v = out[i][ok & (gid[i] == g)]
+        assert v.std(ddof=1) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- 10. 004B：size 新旧口径对拍
+def test_size_cross_check_zero_and_double():
+    """对拍函数：两口径一致时差 0；真实股本翻倍时市值差应为 +100%。"""
+    n_d, n_c = 45, 6
+    dates = trade_days("2020-01-02", n_d)
+    codes = [f"sh.{600000 + j}" for j in range(n_c)]
+    px = np.full((n_d, n_c), 10.0)
+    base = np.full((n_d, n_c), 1e8)
+    ends = month_end_indices(dates)
+    fd_same = make_factor_data(dates, codes, px, px, float_shares=base)
+    a = size_real(px, base)
+    same = size_cross_check(fd_same, a, a.copy(), ends)
+    assert same["available"] and same["median_abs"] == pytest.approx(0.0)
+
+    fd2 = make_factor_data(dates, codes, px, px, float_shares=base * 2.0)
+    b = size_real(px, base * 2.0)
+    doubled = size_cross_check(fd2, a, b, ends)
+    assert doubled["median_abs"] == pytest.approx(1.0), "股本翻倍 → 市值差正好 100%"
+    assert doubled["share_gt30pct"] == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------- 11. 审计-B6 四项
+def test_size_jump_examples_keep_paired_reversal(tmp_path):
+    """B6-03：成对的脏跳变必须成对出现，不许只留幅度最大的那一条。
+
+    造 sz.001289 形状的数据：第 6 天股本 ×2.59、第 8 天 ×0.386（两天又变回去 ≈1）。
+    旧实现每股只取 max|ratio−1|，只剩 ×2.59 一条，读起来像真实解禁。
+    """
+    dates = trade_days("2020-01-02", 12)
+    shares = np.full(12, 1e8)
+    shares[5:] = 1e8 * 2.592
+    # 第二次是**相对前值**的 0.386 倍（2.592×0.386≈1），不是绝对 0.386 亿股
+    shares[7:] = 1e8 * 2.592 * 0.386
+    rows = [{"code": "sz.001289", "date": d, "close": 10.0,
+             "volume": shares[i] * 0.01, "turn": 1.0, "suspended": False}
+            for i, d in enumerate(dates)]
+    pd.DataFrame(rows).to_parquet(tmp_path / "daily_2020.parquet", index=False)
+
+    st = data_quality_stats("2020-01-01", "2020-12-31", cache_dir=tmp_path)
+    ex = [e for e in st["size_jump"]["examples"] if e["code"] == "sz.001289"]
+    assert len(ex) >= 2, f"双跳变被截断成 {len(ex)} 条"
+    paired = [e for e in ex if e["paired_reversal"]]
+    assert paired, "成对反转没被标出来"
+    assert paired[0]["pair_date"] == ex[1]["date"], "配对日期要写清"
+    assert abs(ex[0]["share_ratio"] * ex[1]["share_ratio"] - 1.0) < 0.05
+
+
+def test_report_records_dual_commit_fields(tmp_path):
+    """B6-02：产物必须同时记 code_commit / code_dirty / generated_at，落盘再补 written_*。"""
+    from src.factors import write_report
+    dates, codes, px, fmat = build_rank_panel(n_codes=45, n_months=6, start="2025-06-02")
+    fd = make_factor_data(dates, codes, px, px)
+
+    import argparse
+    args = argparse.Namespace(cash=1e6, seed=42, layers=5, neutralize_method="demean")
+    rep = build_report(fd, {"rank": fmat}, args)
+    assert rep["code_commit"] and len(rep["code_commit"]) >= 7
+    assert rep["git_commit"] == rep["code_commit"], "旧字段保留作别名，不许断链"
+    assert isinstance(rep["code_dirty"], bool)
+    assert rep["generated_at"]
+
+    p = write_report(rep, tmp_path / "r.json")
+    import json as _json
+    d = _json.loads(p.read_text(encoding="utf-8"))
+    assert d["written_at"] and d["written_code_commit"], "落盘要补落盘时刻的版本"
+    assert d["segments"]["dev"]["_meta"]["neutralization"]["enabled"] is False, \
+        "没有行业数据时必须如实标未启用，不许假装做了中性化"
+
+
+def test_lot_residual_reports_cash_median_not_just_claim(tmp_path):
+    """B6-01：现金结论必须来自实测字段（中位/最大都在），免责里不许再写死 0.01%。"""
+    dates, codes, px, fmat = build_rank_panel(n_codes=45, n_months=18, start="2025-06-02")
+    fd = make_factor_data(dates, codes, px, px)
+    import argparse
+    args = argparse.Namespace(cash=1e6, seed=42, layers=5, neutralize_method="demean")
+    rep = build_report(fd, {"rank": fmat}, args)
+    lot = rep["segments"]["dev"]["rank"]["lot_residual"]
+    assert {"cash_median_pct", "cash_max_pct", "cash_p95_pct"} <= set(lot), \
+        "现金指标必须同时给中位/95 分位/最大，只报 min-max 才会写出失实的「<0.01%」"
+    assert lot["cash_max_pct"] >= lot["cash_median_pct"] >= 0
+    assert "0.01% 以下" not in rep["validity_note"]
+    assert f"{lot['cash_max_pct']}" in rep["validity_note"], \
+        "免责里的现金数字必须与产物字段一致（动态生成）"
+
+def test_jump_sentence_uses_measured_ratio_not_old_sample():
+    """B6-04 续：跳变归因必须写全样本实测比例，不许再抄 004B-P 的「12/14」抽样。"""
+    from src.factors import _jump_sentence
+    ja = {"available": True, "jump_cells": 8628, "both_jump_cells": 7804,
+          "both_jump_ratio": 0.9045, "real_coverage": 1.0}
+    txt = _jump_sentence(ja)
+    assert f"{ja['both_jump_ratio']:.1%}" in txt and "8628" in txt and "7804" in txt
+    assert "12/14" not in txt
+    # 未提供对拍结果时只指向产物字段，不编数字
+    assert "jump_agreement" in _jump_sentence({"available": False})

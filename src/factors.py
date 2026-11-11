@@ -33,59 +33,52 @@ dev 末截面 2025-10-31 的窗口是 2025-11-03 open → 2025-12-01 open，越�
 （2025-11-06），等于让 dev 统计吃掉 1 期 holdout 收益。实现见 `ic_periods()`，
 被丢的期连同原因写进报告 `segments.*._meta.ic_periods_dropped`。
 
-数据口径·市值字段（003R3 后仍缺失，总工已裁定接受，不推翻）
------------------------------------------------------------
-cache 宽表**没有**总市值/流通市值字段。`finance.parquet` 的 totalShare/liqaShare
-覆盖率仅 0.15%（270 行 / 64 只，全部来自 baostock 那批），不可用；原始日线
-（data/raw/daily）本身也只有 close/volume/turn，没有市值。
-
-本模块用**换手率定义式**推算流通股本：
-
-    turn(%) = volume / 流通股本 × 100   ⇒   流通股本 = volume / (turn/100)
-    流通市值 = close × 流通股本
-
-这是恒等式推导，不是"换一个估值口径顶替"：误差只来自 turn 的舍入。
-
-**对拍（审计-B5-05 更正，旧描述"2 个样本、误差 7e-6/2e-6"不可复现，已作废）**：
-finance.parquet 里能与面板**同日**对上的只有 1 只（sh.600896 @ 2022-06-30），
-推算 9.45425e8 股 vs liqaShare 9.4544e8，相对误差 1.6e-5；放宽到 ±7 个自然日，
-可对证的仍是这 1 只（8 个交易日，同一 statDate），最差 2.6e-5、中位 1.6e-5。
-分母证据：同一推算值对 liqaShare 误差 2.6e-5，对 totalShare 是 7.7e-2 ——
-相差三个数量级，说明 `volume/turn` 复现的是**流通股本**而不是总股本。
-复现：`python -m src.factors --diag-data`（打印每个对证点与两项误差）。
-
-风险点（B5-03 / B5-04 实测，全部可复现）：
-  · turn 缺失**全样本 0.71%**（68,953 / 9,669,155 行，100% 是停牌行：
-    suspended=True 且 volume=0）；**2018 单年 4.66%**，是九年里最差的一年。
-    旧 docstring 写的"4.66%"是 2018 单年数字，已更正为全局口径。
-  · 解禁/增发会让推算股本**真实跳变**（与真实市值同步跳变，不是误差），但跳变当天
-    直接污染 size 截面：单日跳变 >30% 共 8,628 行 / 3,693 只，其中 2,788 行落在
-    月末前 7 个自然日内（距当月最后交易日 ≤7 个自然日；审计口径记 2,792，差 4 行
-    来自窗口边界的自然日取法，不改变结论）。实证：sz.001289 2025-01-24
-    推算股本一日 ×14.59、size 分位 55.2%→96.8%；sh.603786 2022-10-17 ×9.98、
-    分位 35.3%→90.6%（sh.601698 2022-06-28 ×9.81、53.0%→94.7%）。口径与复现见 `data_quality_stats()` / 产物 `size_jump_stats`。
-
-**size 的任何结论都必须带这个前提读**：它衡量的是"换手率推算市值"，跳变日会被
-当成真实的市值变化。若判定不可接受，只需改 `size()` 一个函数的数据来源，
-框架其余部分不受影响（代价：size 全部结论作废）。产物里 `size_source` 字段固定写
-"log(close*volume/(turn/100))" 以便事后追溯。
-
-分层残差与"绝对水平"（审计-B5-02 更正）
+数据口径·财务（质量因子，公告日对齐）
 --------------------------------------
-旧免责里写的「5 层合并 vs 全截面等权差约 0.2~0.3pp/月」「每层留 2~7% 残差」两处都对不上
-实测，且把两个不同量混为一谈：
+`finance.parquet` 有 netProfit / total_equity / debt_ratio / YOYNI 等高覆盖字段
+（实测 netProfit 99.99%、total_equity 93.99%、debt_ratio 94.54%、YOYNI 93.70%），
+但 **epsTTM 只有 270 行（0.15%，只覆盖 baostock 那批退市股）**，不可用 —— 这是实测，
+不是猜的，复现见 `--diag-data` 的 fundamentals 段。
 
-  · **整手残差**（同引擎、同成本、同 mask，5 层各 1/5 资金合并 vs 全截面等权）：
-    dev·bp 月差 mean|diff| 0.12pp、中位 0.07pp、p90 0.29pp，signed 年化 −0.42pp；
-  · **每层配不满**（部分成交股的未达目标缺口）：0.70%~2.27%，不是"2~7%"；
-    未投入现金 <0.01% —— 引擎按资金约束贪心成交，现金基本买空，残差体现为
-    "某些股票配少了"，不是"留了一笔现金"；
-  · **2pp 级别那个差不只是残差，而且窗口错配**：8.15% 是 dev 段（1903 个交易日）的
-    全截面等权引擎收益，5.87% 是**全期**（2145 日）全市场 hfq 等权基准 —— 两个窗口不同，
-    相减得到的 2.25pp 主要来自窗口而不是股票池。同窗口对比：8.15% vs 8.03%，差 0.13pp。
+时点纪律：财报一律用**公告日** `pubDate`（缺失回退 `pubDate_est`）对齐，
+**绝不用 statDate**。T 日因子值 = 公告日 ≤ T 的最新一期；实现上先按公告日 as-of
+铺成逐日矩阵，再过 `_shift1`，等于"只用 ≤ T-1 已公告的财报"。
+`pubDate` 缺 17,199 行（9.79%），这些行的 `pubdate_src == "deadline_est"`，是用
+法定披露截止日推算的时点，可能晚于真实公告日 —— 会带来**残余前视**，如实写进产物
+`data.fundamentals.pubdate_src`，不做平滑。
 
-以上全部由 `evaluate_segment` 实时产出（`lot_residual` / `_meta.full_xsec` /
-`_meta.market_ew`），复现命令：`python -m src.factors --out out`。
+roe_ttm 不用 `roeAvg`：它是**区间累计**口径（Q1 是三个月、Q4 是全年），直接进截面会让
+因子值随季度季节性摆动。这里改成 `净利润TTM / 期末股东权益`，TTM 由 4 个季度累计值
+还原（q4 直接用年报，q1~q3 = 本期累计 + 上年年报 − 上年同期累计）。
+
+数据口径·市值（004B 起用真实股本，推算口径保留作对拍）
+------------------------------------------------------
+004B-P 勘察裁决：股本改用东财 gbjg **事件级**记录（`data/shares/share_events.parquet`），
+逐日流通股本由事件序列前向填充，`size_real = log(close × 流通股本)`。
+`size`（换手率推算口径 `close×volume/(turn/100)`）保留，两者同表对比，差异分布写进
+`size_compare` —— 这样"换口径到底改了多少"是可验证的，不是嘴上说的。
+
+为什么必须事件级：季度快照（baostock）降级后 8 只样本 11,225 个交易日里 2,094 天
+（18.65%）与事件级差 >30%，解禁后要等一个季度才反映，size 会整段用错股本。
+
+**审计-B5-03 归因更正**：旧稿说"跳变=污染"。实测样本内 14 次推算跳变，12 次 ±3 日内
+有真实股本事件（首发限售上市/转增/战略配售），倍率同日对到三位小数
+（14.588/14.590 等）。所以跳变**多数是资产事实不是数据错误**，换真实股本解决的
+是另外三件事：无事件对应的脏跳变（如 sz.001289 2022-08-24/26 成对异常）、
+低换手日 turn 舍入噪声、停牌日 turn=0 要靠猜。立项动机已按此更正。
+
+行业中性化
+----------
+行业用申万分类**变动历史**（`data/shares/sw_industry.parquet`，带 `计入日期`），
+按"计入日期 ≤ T-1"取当时归属，默认一级（行业代码前 2 位）。截面内按组
+demean 或 zscore（`--neutralize`，默认 demean），组内样本 <5 只的组不处理（留着原值，
+并在产物里记 `n_small_group`）。无行业归属的样本（覆盖不到的那部分）同样保留原值、
+单独计数 —— 不猜行业，也不静默丢样本。
+
+旧免责里的「5 层合并 vs 全截面等权差约 0.2~0.3pp/月」「每层留 2~7% 残差」两处都对不上
+实测，且把两个不同量混为一谈（整手残差 0.12pp/月 vs 每层配不满 0.70~2.27%）。
+**004B 起这些数字全部由 `build_validity_note()` 从实测产物动态生成**（B6-04），
+不再写死在常量里 —— 改默认值后产物不会说谎。
 
 数据字段缺失即停工
 ------------------
@@ -118,36 +111,35 @@ HOLDOUT_START = "2025-11-07"    # 冻结样本第一天（含）—— 业主拍
 
 FACTOR_COLS = ("peTTM", "pbMRQ", "volume", "turn")   # 缺任一个即停工
 
+#: 质量因子所需财报字段（缺任一个即停工上报，不许换字段顶替）
+FIN_COLS = ("netProfit", "total_equity", "debt_ratio", "YOYNI")
+#: 财报时点字段。pubDate 是实际公告日；缺失行回退 pubDate_est（法定截止日推算）
+FIN_TIME_COLS = ("pubDate", "pubDate_est", "pubdate_src", "statDate", "quarter")
+
 MIN_LISTED_DAYS = 60    # 上市不足 60 个交易日的样本不进截面（新股初期价格/市值失真）
 MIN_XSEC = 30           # 截面少于 30 只不算 IC（统计上没有意义）
 MIN_PER_LAYER = 5       # 每层至少 5 只，否则该期跳过
 
 N_LAYERS = 5
 
-VALIDITY_NOTE = (
-    "本报告是因子刻画结果，不构成策略有效性或 alpha 证据。IC/分层收益受以下因素影响："
-    "① 分层为层内等权、月度再平衡，未做行业/风格中性化；"
-    "② IC 用理论开盘价收益，未扣除涨跌停/停牌造成的不可成交（诚实起见：IC 与分层收益之间允许有口径差）；"
-    "③ 市值由换手率推算（宽表无市值字段）：单日推算股本跳变 >30% 共 8,628 行 / 3,693 只，"
-    "其中 2,788 行落在月末前 7 个自然日内（即落在 size 月度截面上），"
-    "如 sz.001289 2025-01-24 推算股本一日 ×14.59、size 分位 55.2%→96.8%，"
-    "sh.603786 2022-10-17 ×9.98、35.3%→90.6%；"
-    "**size 的全部结论必须带这个前提读**（口径与复现见产物 size_jump_stats 字段）；"
-    "④ 截面已剔除 ST/停牌/缺口/上市不足 60 日；"
-    "⑤ holdout 段 12 个月、11 期 IC，样本量不足以支撑统计推断，只作记录；"
-    "⑥ **层间比较有效，绝对水平不可与全市场等权直接相比**。整手残差实测"
-    "（5 层各 1/5 资金合并 vs 全截面等权，同引擎同成本同 mask，dev·bp）：dev 全段月差 "
-    "mean|diff|=0.12pp、中位 0.07pp、p90 0.29pp，signed 年化 −0.42pp；"
-    "每层部分成交缺口 0.70%~2.27%，未投入现金 <0.01%（残差是「配不满」，不是「留现金」）。"
-    "旧稿把「5 层合并 vs 全截面等权差 2.25pp」记作整手残差，是**标签错误**，归因也不对："
-    "2.25pp 来自**窗口错配**（dev 段引擎 8.15% 对全期基准 5.87%），"
-    "同窗口下全截面引擎 8.15% vs 全市场 hfq 等权 8.03%，只差 0.13pp —— 与整手取整无关；"
-    "⑦ 月频 IC 存在自相关，t 值会**高估**显著性，只作量级参考 —— 不以 |t|>2 判定因子有效，"
-    "也不以「唯一 |t|>3」作为结论支点（同表里动量 |t|≈4.1 同样过线）。"
-    "策略有效性判断须待后续中性化与样本外验证，不以本报告为准。"
-)
+#: 行业中性化默认层级：1 = 申万一级（行业代码前 2 位）；实际组数见产物 industry.groups
+INDUSTRY_LEVEL = 1
+#: 组内样本少于此数不中性化（组太小，减出来的均值本身就是噪声）
+MIN_GROUP_SIZE = 5
 
+#: 数据补抓产物（004B 第一部分落盘，均已 gitignore）
+SHARES_EVENTS = ROOT / "data" / "shares" / "share_events.parquet"
+SW_INDUSTRY = ROOT / "data" / "shares" / "sw_industry.parquet"
+
+#: 旧口径（推算）与 004B 新口径（真实股本）的 source 描述，写进产物便于追溯
 SIZE_SOURCE = "log(close*volume/(turn/100))  # 流通市值，由换手率定义式推算"
+SIZE_SOURCE_REAL = ("log(close*float_share)  # 流通市值，float_share 取东财 gbjg "
+                    "事件级已上市流通A股，按变更日期前向填充")
+
+# VALIDITY_NOTE 不再是写死的常量：004B 起由 build_validity_note() 从实测产物动态生成
+# （审计-B6-04：旧版把 8,628 行、0.12pp、<0.01% 等数字写死在字符串里，改默认值后
+#  产物会继续说旧话）。函数定义见文件末尾"产物"段。
+
 
 
 # ---------------------------------------------------------------- 数据层
@@ -173,6 +165,13 @@ class FactorData:
     is_st: np.ndarray
     listed_days: np.ndarray
     source: dict = field(default_factory=dict)
+    # —— 004B 追加（都可为 None：老测试/子集场景不需要财务/股本/行业）
+    roe_ttm: np.ndarray | None = None       # 净利润TTM/期末股东权益（公告日对齐，未 shift）
+    yoy_ni: np.ndarray | None = None        # 净利润同比（%）
+    debt_ratio: np.ndarray | None = None    # 资产负债率（%）
+    float_shares: np.ndarray | None = None  # 逐日流通股本（股，事件级前向填充）
+    industry_gid: np.ndarray | None = None  # 申万行业组 id（int16，-1=无归属）
+    industry_names: dict | None = None      # gid → 行业代码/名称（展示用）
 
     @property
     def dates(self) -> list[str]:
@@ -187,6 +186,10 @@ class FactorData:
         for name in ("pe_ttm", "pb_mrq", "volume", "turn", "is_st", "listed_days"):
             arr = getattr(self, name)
             if arr.shape != shp:
+                raise ValueError(f"{name} 形状 {arr.shape} 与面板 {shp} 不一致")
+        for name in ("roe_ttm", "yoy_ni", "debt_ratio", "float_shares", "industry_gid"):
+            arr = getattr(self, name)
+            if arr is not None and arr.shape != shp:
                 raise ValueError(f"{name} 形状 {arr.shape} 与面板 {shp} 不一致")
 
 
@@ -229,6 +232,304 @@ def _parquet_columns(path: Path) -> list[str]:
         return list(pq.read_schema(path).names)
     except Exception:  # noqa: BLE001 —— 退回 pandas，慢但不至于失败
         return list(pd.read_parquet(path).head(0).columns)
+
+
+# ---------------------------------------------------------------- 004B 数据层：财报 / 股本 / 行业
+
+def align_by_pubdate(rec: pd.DataFrame, dates: list[str], codes: list[str],
+                     col: str = "value") -> np.ndarray:
+    """把「(code, pub_date, value) 记录表」按公告日 as-of 铺成 (n_dates, n_codes)。
+
+    这是**时点纪律的物理实现**：第 i 行拿到的值是"公告日 ≤ dates[i] 的最新一期"。
+    同一公告日多条记录时取最后一条（调用方应已按 statDate 排好序）。
+
+    返回矩阵**未做 shift**：调用方接 `_shift1` 才满足"只用 ≤T-1 的数据"。
+    公告日缺失（NaT）的行必须先被丢掉——NaT 会静默落到 searchsorted 边界，制造前视。
+    """
+    out = np.full((len(dates), len(codes)), np.nan, dtype="float64")
+    if rec is None or not len(rec):
+        return out
+    r = rec.dropna(subset=["pub_date"]).sort_values(["code", "pub_date"])
+    if not len(r):
+        return out
+    d64 = pd.to_datetime(pd.Series(dates)).to_numpy().astype("datetime64[ns]")
+    pos = {c: j for j, c in enumerate(codes)}
+    for code, sub in r.groupby("code", sort=False):
+        j = pos.get(code)
+        if j is None:
+            continue
+        pub = sub["pub_date"].to_numpy().astype("datetime64[ns]")
+        val = pd.to_numeric(sub[col], errors="coerce").to_numpy("float64")
+        k = np.searchsorted(pub, d64, side="right") - 1
+        out[:, j] = np.where(k >= 0, val[np.clip(k, 0, len(val) - 1)], np.nan)
+    return out
+
+
+def prepare_fundamentals(fin: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """财报表 → 质量因子记录表（公告日 + roe_ttm/yoy_ni/debt_ratio）。
+
+    纯函数，不读盘，方便用反例直接测时点纪律。
+
+    · **只用 pubDate / pubDate_est 当时间轴，statDate 绝不参与**；
+      17,199 行（9.79%）没有实际公告日，用法定披露截止日推算的 pubDate_est 顶，
+      这类行数如实计入返回的 stats，不隐藏。
+    · roe_ttm 用 TTM 净利润 / 期末权益：q4 直接用年报，q1~q3 = 本期累计 + 上年年报 −
+      上年同期累计。不用 roeAvg（区间累计口径，混季度会让因子值随季节摆动）。
+    """
+    need = ["code", "statDate", "quarter", *FIN_TIME_COLS[:2], *FIN_COLS]
+    missing = [c for c in need if c not in fin.columns]
+    if missing:
+        raise RuntimeError(
+            f"finance.parquet 缺财报字段 {missing}；质量因子按纪律**停工上报**，"
+            f"不许用其他字段顶替（换字段就是换口径）。")
+
+    d = fin.copy()
+    d["statDate"] = pd.to_datetime(d["statDate"], errors="coerce")
+    d["quarter"] = pd.to_numeric(d["quarter"], errors="coerce")
+    d = d.dropna(subset=["statDate", "quarter"])
+    d["year"] = d["statDate"].dt.year
+
+    # ---- TTM 净利润
+    ann = d.loc[d["quarter"] == 4, ["code", "year", "netProfit"]].rename(
+        columns={"netProfit": "np_annual"})
+    ann_prev = ann.copy()
+    ann_prev["year"] = ann_prev["year"] + 1          # 让"本年"能对上"上年年报"
+    prev_same = d[["code", "year", "quarter", "netProfit"]].rename(
+        columns={"netProfit": "np_prev_same"})
+    prev_same["year"] = prev_same["year"] + 1
+
+    b = d[["code", "statDate", "year", "quarter", "netProfit", "total_equity",
+           "debt_ratio", "YOYNI", "pubDate", "pubDate_est"]].copy()
+    b = b.merge(ann_prev, on=["code", "year"], how="left")
+    b = b.merge(prev_same, on=["code", "year", "quarter"], how="left")
+    ttm = np.where(b["quarter"].to_numpy() == 4,
+                   b["netProfit"].to_numpy("float64"),
+                   b["netProfit"].to_numpy("float64") + b["np_annual"].to_numpy("float64")
+                   - b["np_prev_same"].to_numpy("float64"))
+    b["np_ttm"] = ttm
+    b.loc[b["quarter"] != 4, "np_ttm"] = np.where(
+        np.isfinite(b.loc[b["quarter"] != 4, "np_annual"]) &
+        np.isfinite(b.loc[b["quarter"] != 4, "np_prev_same"]),
+        b.loc[b["quarter"] != 4, "np_ttm"], np.nan)
+
+    eq = b["total_equity"].to_numpy("float64")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        roe = b["np_ttm"].to_numpy("float64") / eq
+    roe = np.where(np.isfinite(roe) & (eq > 0), roe, np.nan)
+    b["roe_ttm"] = roe
+    b["yoy_ni"] = pd.to_numeric(b["YOYNI"], errors="coerce")
+    b["debt_ratio"] = pd.to_numeric(b["debt_ratio"], errors="coerce")
+
+    b["pub_date"] = pd.to_datetime(b["pubDate"], errors="coerce").fillna(
+        pd.to_datetime(b["pubDate_est"], errors="coerce"))
+    used_est = int(b["pubDate"].isna().sum())
+    # 两个公告日字段都缺的行只能整行丢掉 —— 数量必须报出来，否则"可用 15 万行"
+    # 看不出到底筛掉了多少期财报。
+    no_pub = int(b["pub_date"].isna().sum())
+    b = b.dropna(subset=["pub_date"])
+    n_before_dedup = int(len(b))          # 去重前（已剔除无公告日的行）
+    b = b.sort_values(["code", "pub_date", "statDate"]).drop_duplicates(
+        subset=["code", "pub_date"], keep="last").reset_index(drop=True)
+
+    eps_cov = (round(float(fin["epsTTM"].notna().mean()), 6)
+               if "epsTTM" in fin.columns else None)
+    stats = {
+        "rows_in": int(len(fin)), "rows_with_period": int(len(d)),
+        "rows_usable": int(len(b)),
+        # 年报与一季报同日披露是常态（19,189 组），as-of 只要一个值：按 statDate
+        # 取较新那期。差额必须报出来，否则"17 万行只剩 15 万"说不清去哪了。
+        "rows_same_day_collapsed": int(n_before_dedup - len(b)),
+        "same_day_collapse_note": "同 code+公告日多期（最常见=年报+一季报同日）"
+                                  "保留 statDate 较新的一期",
+        "codes": int(b["code"].nunique()),
+        "pubdate_missing_rows": used_est,
+        # 分母用"有报告期的行"，不是原始行数：被 statDate/quarter 丢掉的不该拉低比例
+        "pubdate_missing_rate": round(used_est / max(len(d), 1), 6),
+        "pubdate_unresolved_rows": no_pub,
+        "pubdate_unresolved_rate": round(no_pub / max(len(d), 1), 6),
+        "pubdate_unresolved_note": "pubDate 与 pubDate_est 都缺，无法定时点，整行剔除",
+        "pubdate_source": "pubDate 实际公告日；缺失回退 pubDate_est（法定披露截止日推算）",
+        "field_coverage": {c: round(float(fin[c].notna().mean()), 6) for c in FIN_COLS},
+        "epsTTM_coverage": eps_cov,
+        "epsTTM_note": (None if eps_cov is None else
+                        f"epsTTM 覆盖率 {eps_cov:.2%}（只有 baostock 那批退市股），不可用作因子"),
+    }
+    return b[["code", "pub_date", "statDate", "roe_ttm", "yoy_ni", "debt_ratio"]], stats
+
+
+def load_fundamentals(dates: list[str], codes: list[str], path: Path | None = None
+                      ) -> tuple[dict[str, np.ndarray], dict]:
+    """载入并铺平质量因子（未 shift）。字段缺失抛 RuntimeError（停工上报）。"""
+    p = path or (CACHE / "finance.parquet")
+    if not p.exists():
+        raise FileNotFoundError(f"缺 {p}，质量因子无法计算")
+    cols = ["code", "statDate", "quarter", "pubDate", "pubDate_est", *FIN_COLS]
+    have = set(_parquet_columns(p))
+    missing = [c for c in cols if c not in have]
+    if missing:
+        raise RuntimeError(f"{p.name} 缺 {missing}，按纪律停止施工并上报。")
+    if "epsTTM" in have:            # 只为算覆盖率，不进因子
+        cols = [*cols, "epsTTM"]
+    fin = pd.read_parquet(p, columns=cols)
+    rec, stats = prepare_fundamentals(fin)
+    out = {k: align_by_pubdate(rec, dates, codes, k)
+           for k in ("roe_ttm", "yoy_ni", "debt_ratio")}
+    return out, stats
+
+
+def share_float_matrix(dates: list[str], codes: list[str], path: Path | None = None
+                       ) -> tuple[np.ndarray, dict]:
+    """逐日流通股本矩阵（事件级前向填充），单位：股。
+
+    `float_share_a`（东财「已上市流通A股」）优先，缺失回退 `float_share`（已流通股份）——
+    勘察已证实换手率的分母是前者，后者含 B/H 股口径时会差出数量级。
+    上市前/退市后的日期没有事件 → 保持 NaN，不猜（用 0 会让 size 变成 -inf）。
+    """
+    p = path or SHARES_EVENTS
+    if not p.exists():
+        raise FileNotFoundError(
+            f"缺 {p}；先跑 python -m src.fetch_shares --stage shares")
+    ev = pd.read_parquet(p, columns=["code", "event_date", "float_share_a",
+                                     "float_share", "reason"])
+    # 只认**正的**股本：实测 1,373 行 float_share_a=0（A 股尚未流通/仅 B 股）而
+    # float_share>0，按"非缺失优先"取 0 会让这些事件整行被丢，等于该股一开始
+    # 就没有股本、size_real 白白空掉一段。
+    a = ev["float_share_a"].where(ev["float_share_a"] > 0)
+    b = ev["float_share"].where(ev["float_share"] > 0)
+    sh = a.where(a.notna(), b)
+    ev = ev.assign(value=sh).dropna(subset=["value"])
+    rec = ev.rename(columns={"event_date": "pub_date"})
+    m = align_by_pubdate(rec, dates, codes, "value")
+
+    covered = int(np.isfinite(m).any(axis=0).sum())
+    stats = {
+        "path": str(p.relative_to(ROOT)) if str(p).startswith(str(ROOT)) else str(p),
+        "events_rows": int(len(ev)), "events_codes": int(ev["code"].nunique()),
+        "codes_covered": covered, "codes_total": len(codes),
+        "codes_coverage": round(covered / max(len(codes), 1), 6),
+        "cells_filled": int(np.isfinite(m).sum()),
+        "cells_total": int(m.size),
+        "cells_filled_rate": round(float(np.isfinite(m).mean()), 6),
+        "definition": "float_share_a（>0 优先）否则回退 float_share；按变更日期前向填充到面板日历",
+    }
+    return m, stats
+
+
+def industry_matrix(dates: list[str], codes: list[str], level: int = INDUSTRY_LEVEL,
+                    path: Path | None = None) -> tuple[np.ndarray, dict]:
+    """行业归属矩阵（int16 组号，-1 = 无归属），按**计入日期**做时点匹配。
+
+    行业代码是申万 6 位码，level=1 取前 2 位、2 取前 4 位、3 取全 6 位；组数只算"本面板真有股票"的那些，写进返回的 stats["groups"]。
+    时点用 `in_date`（计入日期）而不是 `update_date`：后者是记录被改写的日期，
+    中位比 in_date 晚 1,356 天，拿它当时间轴等于用今天的分组回测历史。
+    """
+    p = path or SW_INDUSTRY
+    if not p.exists():
+        raise FileNotFoundError(
+            f"缺 {p}；先跑 python -m src.fetch_shares --stage industry")
+    cut = 2 * level
+    sw = pd.read_parquet(p, columns=["panel_code", "industry_code", "in_date"])
+    sw = sw.dropna(subset=["in_date"])
+    sw["grp"] = sw["industry_code"].astype(str).str[:cut]
+    sw = sw[sw["grp"].str.len() == cut]
+
+    pos = {c: j for j, c in enumerate(codes)}
+    n_d, n_c = len(dates), len(codes)
+    raw = np.full((n_d, n_c), "", dtype=object)
+    d64 = pd.to_datetime(pd.Series(dates)).to_numpy().astype("datetime64[ns]")
+    for code, sub in sw.groupby("panel_code", sort=False):
+        j = pos.get(code)
+        if j is None:
+            continue
+        sub = sub.sort_values("in_date")
+        ind = sub["in_date"].to_numpy().astype("datetime64[ns]")
+        grp = sub["grp"].to_numpy()
+        k = np.searchsorted(ind, d64, side="right") - 1
+        raw[:, j] = np.where(k >= 0, grp[np.clip(k, 0, len(grp) - 1)], "")
+
+    uniq = sorted({g for g in raw.ravel() if g})
+    gmap = {g: i for i, g in enumerate(uniq)}
+    ids = np.full((n_d, n_c), -1, dtype="int16")
+    for j in range(n_c):
+        colv = raw[:, j]
+        ids[:, j] = np.array([gmap.get(g, -1) for g in colv], dtype="int16")
+
+    known = int((ids >= 0).any(axis=0).sum())
+    stats = {
+        "level": level, "groups": len(uniq),
+        "codes_with_industry": known, "codes_total": n_c,
+        "codes_coverage": round(known / max(n_c, 1), 6),
+        "cells_unmapped": int((ids < 0).sum()), "cells_total": int(ids.size),
+        "source": str(p.relative_to(ROOT)) if str(p).startswith(str(ROOT)) else str(p),
+        "time_axis": "计入日期 in_date（非 update_date）",
+        "group_codes_sample": uniq[:5],
+    }
+    return ids, stats
+
+
+def size_real(close_raw: np.ndarray, float_shares: np.ndarray) -> np.ndarray:
+    """小市值因子（真实股本口径）= log(close(T-1) × 流通股本(T-1))。
+
+    与推算口径的区别只在股本来源：这里直接用事件级流通股本，停牌日照样有股本
+    （不像 turn 缺失要靠猜），低换手日的舍入噪声也不存在。
+    """
+    c = _shift1(close_raw)
+    sh = _shift1(float_shares)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        fmv = c * sh
+    bad = (~np.isfinite(fmv)) | (fmv <= 0) | ~(sh > 0)
+    fmv = np.where(bad, np.nan, fmv)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.log(fmv)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
+def neutralize_matrix(fmat: np.ndarray, fd: FactorData, ends: list[int],
+                      gids: np.ndarray, method: str = "demean",
+                      min_group: int = MIN_GROUP_SIZE) -> tuple[np.ndarray, dict]:
+    """行业中性化：月度截面内按行业组去均值（demean）或标准化（zscore）。
+
+    只在**截面日**处理（其余行为原样复制）——分层与 IC 都只用截面日的值，
+    逐日中性化没有意义还慢。
+
+    三条不动的样本：① 不在截面 mask 内；② 因子值非有限；③ 该组样本 < min_group。
+    后两类保留原值并计数 —— 组太小的时候"减去组均值"减掉的是噪声本身。
+    """
+    if method not in ("demean", "zscore"):
+        raise ValueError(f"未知中性化方法 {method!r}")
+    out = fmat.copy()
+    n_small = n_unmapped = n_done = 0
+    for i in ends:
+        ok = cross_section_mask(fd, i)
+        x = out[i]
+        g = gids[i]
+        sel = ok & np.isfinite(x)
+        n_unmapped += int((sel & (g < 0)).sum())
+        sel &= (g >= 0)
+        if not sel.any():
+            continue
+        s = pd.Series(x[sel])
+        grp = pd.Series(g[sel])
+        for _, idxs in grp.groupby(grp).groups.items():
+            pos = np.asarray(idxs, dtype=int)
+            if len(pos) < min_group:
+                n_small += len(pos)
+                continue
+            v = s.iloc[pos].to_numpy("float64")
+            if method == "demean":
+                x[np.flatnonzero(sel)[pos]] = v - v.mean()
+            else:
+                sd = v.std(ddof=1)
+                if not np.isfinite(sd) or sd <= 0:
+                    n_small += len(pos)
+                    continue
+                x[np.flatnonzero(sel)[pos]] = (v - v.mean()) / sd
+            n_done += len(pos)
+    stats = {"method": method, "n_cells_neutralized": n_done,
+             "n_small_group_cells": n_small, "n_unmapped_cells": n_unmapped,
+             "min_group": min_group}
+    return out, stats
 
 
 # ---------------------------------------------------------------- 数据质量（B5-03 / B5-04 / B5-05）
@@ -306,25 +607,39 @@ def data_quality_stats(start: str, end: str, cache_dir: Path | None = None,
     delta = (pd.to_datetime(ym.map(me)).to_numpy() - dt.to_numpy()).astype("timedelta64[D]").astype(int)
     in_window = flag & (delta <= month_end_days)
 
-    # 实证案例：固定代码里取跳变最猛的一次，附截面分位（当天全样本 rank，含 ST/新股）
+    # 实证案例：固定代码，**按时间列全**（审计-B6-03：旧版每股只取幅度最大的那一次，
+    # 把 sz.001289 2022-08-24 的 ×2.59 与 2022-08-26 的 ×0.39 这对"两天又变回去"的
+    # 脏跳变截断成了单条，读起来像真实解禁。成对的就标 paired，不许截。）
     size = pd.Series(np.log(np.where(np.isfinite(sh), d["close"].to_numpy("float64") * sh, np.nan)))
     pct = size.groupby(d["date"]).rank(pct=True).to_numpy()
+    max_per_case = 6
     examples = []
     for c in JUMP_CASES:
         m = (code == c).to_numpy()
         if not m.any():
             continue
-        idx = np.nonzero(m & flag)[0]
+        idx = np.nonzero(m & flag)[0]          # 数据已按 (code, date) 排序，idx 即时间序
         if not len(idx):
             continue
-        k = idx[np.argmax(np.abs(ratio[idx] - 1.0))]
-        j = k - 1 if k - 1 >= 0 and code.iloc[k - 1] == c else None
-        examples.append({
-            "code": c, "date": str(d["date"].iloc[k]),
-            "share_ratio": round(float(ratio[k]), 6),
-            "size_pct_before": None if j is None or not np.isfinite(pct[j]) else round(float(pct[j]), 6),
-            "size_pct_after": None if not np.isfinite(pct[k]) else round(float(pct[k]), 6),
-        })
+        picks = idx[:max_per_case]
+        for t, k in enumerate(picks):
+            j = k - 1 if k - 1 >= 0 and code.iloc[k - 1] == c else None
+            nxt = picks[t + 1] if t + 1 < len(picks) else None
+            paired = bool(nxt is not None and (nxt - k) <= 5 and
+                          abs(float(ratio[k]) * float(ratio[nxt]) - 1.0) < 0.05)
+            examples.append({
+                "code": c, "date": str(d["date"].iloc[k]),
+                "share_ratio": round(float(ratio[k]), 6),
+                "size_pct_before": (None if j is None or not np.isfinite(pct[j])
+                                    else round(float(pct[j]), 6)),
+                "size_pct_after": (None if not np.isfinite(pct[k])
+                                   else round(float(pct[k]), 6)),
+                # 成对异常：两次跳变乘起来≈1（几天内涨回去），说明是脏数据而非资产事实
+                "paired_reversal": paired,
+                "pair_date": (None if not paired else str(d["date"].iloc[nxt])),
+                "truncated": bool(len(idx) > max_per_case),
+                "n_jumps_code": int(len(idx)),
+            })
 
     size_jump = {
         "threshold": jump_threshold,
@@ -335,8 +650,10 @@ def data_quality_stats(start: str, end: str, cache_dir: Path | None = None,
         "month_end_rows": int(in_window.sum()),
         "month_end_window": "距当月最后一个交易日 ≤N 个自然日（含月末当日）",
         "examples": examples,
-        "note": "解禁/增发是真实股本变化，不是数据错误；但它会在 size 截面上表现为"
-                "一次无经济含义的市值跳变，故 size 结论须带此前提",
+        "note": "跳变本身多数是**真实解禁/增发事件**（004B-P 抽样 14 次里 12 次能在 ±3 日内"
+                "找到真实股本事件，倍率同日对到三位小数），不是数据错误；"
+                "但它会让 size 在截面上一日跳十几个百分点，所以 004B 起同时给 size_real"
+                "（事件级真实股本）做对照，见产物 size_compare",
     }
 
     # ---- B5-05 真实股本对拍（同日 / ±7 日两组）
@@ -390,11 +707,21 @@ def data_quality_stats(start: str, end: str, cache_dir: Path | None = None,
 
 
 def load_factor_data(start: str, end: str, codes: list[str] | None = None,
-                     cache_dir: Path | None = None) -> FactorData:
-    """载入因子数据。价格与 mask 完全来自 `load_panel`，本函数只追加 6 列。
+                     cache_dir: Path | None = None, *,
+                     with_fundamentals: bool = True,
+                     with_shares: bool = True,
+                     with_industry: bool = True,
+                     industry_level: int = INDUSTRY_LEVEL) -> FactorData:
+    """载入因子数据。价格与 mask 完全来自 `load_panel`，本函数只追加附加列。
 
     字段缺失（peTTM / pbMRQ / volume / turn 任一不存在）→ RuntimeError 停工。
     这是硬约束：换字段就是换口径，静默降级会让报告失真且无法事后发现。
+
+    004B 追加三块（都可关掉，老测试仍按 6 列构造）：
+      · 质量因子 roe_ttm / yoy_ni / debt_ratio —— 公告日对齐；
+      · float_shares 逐日流通股本 —— 东财 gbjg 事件级前向填充；
+      · industry_gid 申万行业组号 —— 按计入日期时点匹配。
+    数据文件缺失时**抛错不跳过**：静默跳过等于报告里悄悄少几个因子。
     """
     cache_dir = cache_dir or CACHE
     years = range(int(start[:4]), int(end[:4]) + 1)
@@ -431,6 +758,32 @@ def load_factor_data(start: str, end: str, codes: list[str] | None = None,
             index=dates_all, columns=codes_all)
         return m.to_numpy(dtype="float64", na_value=np.nan)
 
+    src = {
+        "start": dates_all[0], "end": dates_all[-1],
+        "dates": len(dates_all), "codes": len(codes_all),
+        "rows": int(len(extra)),
+        "hfq_gap_rows": panel.source.get("hfq_gap_rows", {}),
+        "size_source": SIZE_SOURCE,
+        "size_source_real": SIZE_SOURCE_REAL,
+        "min_listed_days": MIN_LISTED_DAYS,
+        "fields": list(FACTOR_COLS),
+    }
+
+    kw: dict = {}
+    if with_fundamentals:
+        fund, fstats = load_fundamentals(dates_all, codes_all)
+        kw.update(roe_ttm=fund["roe_ttm"], yoy_ni=fund["yoy_ni"],
+                  debt_ratio=fund["debt_ratio"])
+        src["fundamentals"] = fstats
+    if with_shares:
+        shm, sstats = share_float_matrix(dates_all, codes_all)
+        kw["float_shares"] = shm
+        src["shares"] = sstats
+    if with_industry:
+        gids, istats = industry_matrix(dates_all, codes_all, level=industry_level)
+        kw["industry_gid"] = gids
+        src["industry"] = istats
+
     fd = FactorData(
         panel=panel,
         pe_ttm=_mat("peTTM"),
@@ -441,15 +794,8 @@ def load_factor_data(start: str, end: str, codes: list[str] | None = None,
         # 上市天数按 ipoDate 重算（clean.py 的 listed_days 相对面板起点，会把
         # 存量股算成"上市第 1 天"，详见 _real_listed_days）
         listed_days=_real_listed_days(dates_all, codes_all),
-        source={
-            "start": dates_all[0], "end": dates_all[-1],
-            "dates": len(dates_all), "codes": len(codes_all),
-            "rows": int(len(extra)),
-            "hfq_gap_rows": panel.source.get("hfq_gap_rows", {}),
-            "size_source": SIZE_SOURCE,
-            "min_listed_days": MIN_LISTED_DAYS,
-            "fields": list(FACTOR_COLS),
-        },
+        source=src,
+        **kw,
     )
     return fd
 
@@ -523,13 +869,40 @@ def size(close_raw: np.ndarray, volume: np.ndarray, turn: np.ndarray) -> np.ndar
     return out
 
 
+def _need(fd: FactorData, attr: str, factor: str) -> np.ndarray:
+    """取因子依赖的附加数据；没载入就报错，不许悄悄返回空矩阵。"""
+    v = getattr(fd, attr, None)
+    if v is None:
+        raise RuntimeError(
+            f"因子 {factor} 依赖 {attr}，但当前 FactorData 没载入该数据源；"
+            f"请用 load_factor_data(..., {attr}=True) 或检查 data/shares 是否已抓取。")
+    return v
+
+
+def _quality(mat: np.ndarray) -> np.ndarray:
+    """质量因子：矩阵已按公告日 as-of 铺好，再过 _shift1 满足"只用 ≤T-1 已公告"。"""
+    out = _shift1(mat)
+    out[~np.isfinite(out)] = np.nan
+    return out
+
+
 FACTOR_DEFS = {
     "momentum_20": lambda fd: momentum(fd.panel.close_hfq, 20),
     "momentum_60": lambda fd: momentum(fd.panel.close_hfq, 60),
     "ep": lambda fd: ep(fd.pe_ttm),
     "bp": lambda fd: bp(fd.pb_mrq),
     "size": lambda fd: size(fd.panel.close_raw, fd.volume, fd.turn),
+    # —— 004B 新增
+    "size_real": lambda fd: size_real(fd.panel.close_raw,
+                                      _need(fd, "float_shares", "size_real")),
+    "roe_ttm": lambda fd: _quality(_need(fd, "roe_ttm", "roe_ttm")),
+    "yoy_ni": lambda fd: _quality(_need(fd, "yoy_ni", "yoy_ni")),
+    "debt_ratio": lambda fd: _quality(_need(fd, "debt_ratio", "debt_ratio")),
 }
+
+#: 004B 报告默认因子集（既有 5 个 + 质量 3 个 + 真实股本 size）
+DEFAULT_FACTORS = ("momentum_20", "momentum_60", "ep", "bp", "size",
+                   "size_real", "roe_ttm", "yoy_ni", "debt_ratio")
 
 
 def compute_factors(fd: FactorData, names: list[str] | None = None) -> dict[str, np.ndarray]:
@@ -960,6 +1333,14 @@ def lot_residual_stats(layer_navs: list[pd.DataFrame | None],
         "layer_cash_pct": [f.get("cash_pct") for f in fills],
         "cash_min_pct": cash_lo,
         "cash_max_pct": cash_hi,
+        # 审计-B6-01：旧稿只报了 min/max 就说"未投入现金 <0.01%"，而实测单期最大
+        # 到 3.88%。补中位与全样本分位，让"到底留了多少现金"能被核对。
+        "cash_median_pct": (round(float(np.median([f["cash_pct"] for f in fills
+                                                   if f.get("cash_pct") is not None])), 4)
+                            if any(f.get("cash_pct") is not None for f in fills) else None),
+        "cash_p95_pct": (round(float(np.quantile([f["cash_pct"] for f in fills
+                                                  if f.get("cash_pct") is not None], 0.95)), 4)
+                         if any(f.get("cash_pct") is not None for f in fills) else None),
         "definition": "① 5 层各 1/5 资金合并 vs 全截面等权，逐月差（pp）；"
                       "② 部分成交股未达目标缺口（执行日，各期中位数）；"
                       "③ 整体权重偏差 ½Σ|实际−目标|；④ 未投入现金占比",
@@ -970,8 +1351,14 @@ def lot_residual_stats(layer_navs: list[pd.DataFrame | None],
 
 def evaluate_segment(factors: dict[str, np.ndarray], fd: FactorData,
                      i0: int, i1: int, cfg_template: Config,
-                     n_layers: int = N_LAYERS) -> dict:
-    """在一段区间上做 IC + 分层回测（因子定义不随段变化）。"""
+                     n_layers: int = N_LAYERS, *, neutralize: bool = False,
+                     gids: np.ndarray | None = None,
+                     method: str = "demean") -> dict:
+    """在一段区间上做 IC + 分层回测（因子定义不随段变化）。
+
+    neutralize=True 时，截面日上的因子值先做行业中性化（见 neutralize_matrix），
+    非截面日不处理。两组结果分开产出，用于对比"中性化到底改变了什么"。
+    """
     dates = fd.dates[i0:i1]
     panel = slice_panel(fd.panel, i0, i1)
 
@@ -986,6 +1373,17 @@ def evaluate_segment(factors: dict[str, np.ndarray], fd: FactorData,
     fwd = forward_returns(fd.panel.open_hfq, ends_global)
     usable, dropped = ic_periods(fd, i0, i1)
 
+    neu_stats: dict = {"enabled": bool(neutralize), "method": method if neutralize else None,
+                       "min_group": MIN_GROUP_SIZE if neutralize else None}
+    if neutralize:
+        gids = gids if gids is not None else fd.industry_gid
+        if gids is None:
+            raise RuntimeError(
+                "neutralize=True 需要行业组号；load_factor_data(with_industry=True) 未载入行业，"
+                "或先跑 python -m src.fetch_shares --stage industry")
+    else:
+        gids = gids if gids is not None else fd.industry_gid
+
     # 诊断基准：全截面等权（同引擎同成本），只用于拆解整手残差
     bench_sig = build_full_xsec_signal(fd, ends_all)
     bench = run_backtest(panel, bench_sig, cfg) if bench_sig else None
@@ -995,6 +1393,9 @@ def evaluate_segment(factors: dict[str, np.ndarray], fd: FactorData,
 
     res = {}
     for name, fmat in factors.items():
+        if neutralize:
+            fmat, ns = neutralize_matrix(fmat, fd, ends_all, gids, method=method)
+            neu_stats.setdefault("factors", {})[name] = ns
         ics = []
         for p in usable:
             i, k = p["idx"], p["k"]
@@ -1028,6 +1429,7 @@ def evaluate_segment(factors: dict[str, np.ndarray], fd: FactorData,
                     # B5-01：IC 期数以"不跨段"为准，被丢的期连同原因全部留痕
                     "n_ic_periods": len(usable),
                     "ic_periods_dropped": dropped,
+                    "neutralization": neu_stats,
                     "full_xsec": ({"ann_return": round(float(M.ann_return(
                         M.to_series(bench.nav))), 6),
                         "n_trades": int(len(bench.trades)),
@@ -1068,13 +1470,16 @@ def _layer_shape(layer_ann: list[float]) -> dict:
                                   "pp": float((a_hi - a_lo) * 100.0)}}
 
 
-def _readings(dev: dict, ho: dict) -> list[str]:
+def _readings(dev: dict, ho: dict, neu: dict | None = None,
+              size_cmp: dict | None = None,
+              jump_agree: dict | None = None) -> list[str]:
     """按数字自动生成的"怎么读"（B5-07：措辞随数字走，不写死的形容词）。
 
     审计-B5 指出三处措辞与数字不符，这里全部改成从 layer_ann 直接算：
       ① ep 不是 U 形（峰在中间偏高层、谷在 Q2）；② size 在 dev 是后段断崖、谷底在 Q5，
       不是"中间塌陷"（真中间塌陷只在 holdout 出现，11 期不足以下结论）；
       ③ bp 的 |t|>3 不是唯一，动量 |t|≈4.1 同样过线。
+    004B 追加：质量因子与 size 新旧口径的读法，同样只描述数字。
     """
     out = []
     ep_s = _layer_shape(dev["ep"]["layer_ann"]) if "ep" in dev else {}
@@ -1103,13 +1508,286 @@ def _readings(dev: dict, ho: dict) -> list[str]:
             f"momentum_60 |t|={abs(dev['momentum_60']['t_stat']):.2f}，"
             f"且月频 IC 自相关会高估 t 值 —— 只能说「bp 方向与量级值得跟进」，"
             f"不能说「只有 bp 有效」。")
+
+    # ---- 004B：质量因子（只陈述数字，显著性照实说）
+    q = [(k, dev[k]) for k in ("roe_ttm", "yoy_ni", "debt_ratio") if k in dev]
+    if q:
+        bits = "；".join(f"{k} IC={v['ic_mean']:+.4f}（t={v['t_stat']:+.2f}，"
+                        f"{v['n_periods']} 期）" for k, v in q)
+        over = [k for k, v in q if abs(v["t_stat"]) > 2]
+        out.append(
+            f"质量因子（公告日对齐）：{bits}。"
+            + (f"过 |t|>2 的：{', '.join(over)} —— 但月频 IC 自相关会高估 t，"
+               f"只能算「值得继续跟」，不能当 alpha。"
+               if over else
+               "三个都没过 |t|>2 —— 在 dev 段看不出质量因子有稳定截面区分度，"
+               "这本身就是结论，不要硬讲成「方向对」。" if q else ""))
+
+    # ---- 004B：size 新旧口径
+    if size_cmp:
+        dev_cmp = size_cmp.get("dev") or {}
+        ic = (size_cmp.get("ic") or {}).get("dev") or {}
+        if dev_cmp.get("available"):
+            _real_ic = ic.get("size_real")
+            _ic_s = _f(ic.get("size"), "+.4f")
+            if _real_ic is None or not np.isfinite(float(_real_ic)):
+                # 真实股本没覆盖到（抓取没跑完/个别票缺失）时，只说拿到了什么，
+                # 不能反过来断言"两口径一致"—— 那是没数可比的默认话术。
+                out.append(
+                    f"size 两口径：真实口径本次不可用（size_real 无有效 IC），"
+                    f"只有推算口径 IC {_ic_s}。月度截面市值差中位 "
+                    f"{_f(dev_cmp.get('median_abs'))}、最大 {_f(dev_cmp.get('max_abs'))}。"
+                    f"结论：**本轮不能拿 size_real 替换 size**，先补股本再谈口径差异。")
+            else:
+                _both = (jump_agree or {}).get("both_jump_ratio")
+                _gt5 = dev_cmp.get("share_gt5pct")
+                _tail = (
+                    f"推算侧跳变里 {_both:.1%} 在真实侧同日也跳，剩下 {1 - _both:.1%} "
+                    f"属脏跳变（低换手日舍入/停牌复牌）—— 差异就出在后者，不是全局重排。"
+                    if isinstance(_both, (int, float)) else
+                    "差异集中在少数跳变日，不是全局重排。")
+                out.append(
+                    f"size 两口径：月度截面市值差 中位 {_f(dev_cmp['median_abs'])}、"
+                    f"p90 {_f(dev_cmp['p90_abs'])}、最大 {_f(dev_cmp['max_abs'])}"
+                    + (f"，差 <5% 的点占 {_f(1 - _gt5, '.2%')}" if isinstance(_gt5, (int, float)) else "")
+                    + f"，超过 30% 的占 {_f(dev_cmp['share_gt30pct'], '.2%')}；"
+                    f"IC 推算 {_ic_s} vs 真实 {_f(_real_ic, '+.4f')}。" + _tail)
+
+    # ---- 004B：行业中性化前后
+    if neu and neu.get("compare"):
+        cmp_dev = neu["compare"]["dev"]
+        delta = sorted(((k, v["delta_ic"]) for k, v in cmp_dev.items()),
+                       key=lambda x: -abs(x[1]))[:3]
+        bits = "；".join(f"{k} ΔIC={d:+.4f}" for k, d in delta)
+        out.append(
+            f"行业中性化（申万 {neu.get('level')} 级 {neu.get('groups')} 组，"
+            f"{neu.get('method')}）：IC 变化最大的三个 {bits}。"
+            f"中性化前后两组结果分列 segments / segments_neutralized，"
+            f"谁高谁低都如实报 —— 中性化不是「一定更好」，它只是拿掉行业暴露。")
     return out
+
+
+def _git_meta() -> dict:
+    """产物溯源三元组（审计-B6-02）。
+
+    旧版只写一个 `git_commit`，而产物通常在提交**之前**生成 —— 于是产物里的哈希
+    永远指向上一笔代码，"这份报告到底是哪版代码算的"无法回答。现在拆成：
+      · code_commit     生成时代码所在的 HEAD；
+      · code_dirty      生成时工作区是否有未提交改动（有改动就该标 True）；
+      · generated_at    生成时刻。
+    `write_report()` 还会再补一个 written_at，落盘时刻与生成时刻分开记。
+    """
+    commit = _git_commit()
+    try:
+        # 不能先 .strip()：porcelain 首行是" M path"，前导空格是状态位的一半，
+        # strip 掉再切 [3:] 会把 "AGENTS.md" 切成 "GENTS.md"（实测踩过）。
+        # -c core.quotepath=false：中文路径直接给 UTF-8，别输出 \344\270\211 这种八进制。
+        out = subprocess.run(["git", "-c", "core.quotepath=false",
+                              "status", "--porcelain"], cwd=ROOT, check=True,
+                             capture_output=True, text=True).stdout
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        dirty = bool(lines)
+        dirty_files = [ln[3:].strip() for ln in lines][:20]
+    except Exception:  # noqa: BLE001
+        dirty, dirty_files = None, []
+    return {"code_commit": commit, "git_commit": commit, "code_dirty": dirty,
+            "code_dirty_files": dirty_files,
+            "generated_at": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def size_cross_check(fd: FactorData, f_old: np.ndarray, f_new: np.ndarray,
+                     ends: list[int]) -> dict:
+    """新旧 size 口径对拍：在月度截面上比较流通市值（相对差）。
+
+    两个口径都是 log(流通市值)，相减再 exp 就是市值相对差 —— 直接回答
+    "换成真实股本后，size 到底变了多少"，而不是靠印象。
+    """
+    diffs = []
+    n_pts = 0
+    for i in ends:
+        ok = cross_section_mask(fd, i)
+        a, b = f_old[i][ok], f_new[i][ok]
+        m = np.isfinite(a) & np.isfinite(b)
+        n_pts += int(m.sum())
+        if m.any():
+            diffs.append(np.exp(b[m] - a[m]) - 1.0)
+    if not diffs:
+        return {"available": False, "reason": "no_overlap"}
+    d = np.concatenate(diffs)
+    a = np.abs(d)
+    return {
+        "available": True, "n_points": int(n_pts), "n_cross_sections": len(ends),
+        "median_abs": round(float(np.median(a)), 8),
+        "p90_abs": round(float(np.quantile(a, 0.90)), 8),
+        "p99_abs": round(float(np.quantile(a, 0.99)), 8),
+        "max_abs": round(float(a.max()), 8),
+        "share_gt5pct": round(float((a > 0.05).mean()), 8),
+        "share_gt30pct": round(float((a > 0.30).mean()), 8),
+        "definition": "月度截面 |真实股本市值/推算股本市值 − 1|，两口径都取 T-1",
+    }
+
+
+def share_jump_agreement(fd: FactorData, threshold: float = 0.30) -> dict:
+    """解禁跳变日两口径是否一致（004B-P 的核心实证，这里做成可复算的产物字段）。
+
+    逐日算两个股本序列的相邻比：推算 `volume/(turn/100)` 与真实 `float_shares`。
+    取推算侧跳变（|比−1|>阈值）的日子，看真实侧同日是否也跳、倍数差多少。
+    差异大的那些日子就是"推算口径的脏跳变"（勘察里 sz.001289 2022-08-24/26 即此类）。
+    """
+    if fd.float_shares is None:
+        return {"available": False, "reason": "no_float_shares"}
+    v, t = fd.volume, fd.turn
+    with np.errstate(divide="ignore", invalid="ignore"):
+        imp = v / (t / 100.0)
+    imp[~(np.isfinite(imp)) | (imp <= 0)] = np.nan
+    imp = pd.DataFrame(imp).ffill().to_numpy()          # 停牌日沿用上一有效观测
+    r_imp = np.full_like(imp, np.nan)
+    r_imp[1:] = imp[1:] / imp[:-1]
+    r_real = np.full_like(fd.float_shares, np.nan, dtype="float64")
+    r_real[1:] = fd.float_shares[1:] / fd.float_shares[:-1]
+
+    jump = np.isfinite(r_imp) & (np.abs(r_imp - 1.0) > threshold)
+    both = jump & np.isfinite(r_real) & (np.abs(r_real - 1.0) > threshold)
+    rel = np.abs(np.log(np.where(np.isfinite(r_real) & (r_real > 0), r_real, np.nan))
+                 - np.log(np.where(np.isfinite(r_imp) & (r_imp > 0), r_imp, np.nan)))
+    both_rel = rel[both & np.isfinite(rel)]
+    n_codes_real = int(np.isfinite(fd.float_shares).any(axis=0).sum())
+    n_codes = int(fd.float_shares.shape[1])
+    return {
+        "available": True, "threshold": threshold,
+        # 覆盖率不报的话，股本只抓到几只时 both_jump_ratio≈0 会被误读成
+        # "推算口径全是脏数据"，方向正好相反。
+        "codes_with_real_shares": n_codes_real,
+        "codes_total": n_codes,
+        "real_coverage": round(n_codes_real / max(n_codes, 1), 6),
+        # 计数单位是**股票·日**，不是自然日：同一天可能几十只票跳变
+        "jump_cells": int(jump.sum()),
+        "jump_codes": int(jump.any(axis=0).sum()),
+        "both_jump_cells": int(both.sum()),
+        "both_jump_ratio": round(float(both.sum() / max(int(jump.sum()), 1)), 6),
+        "ratio_logdiff_median": (None if not len(both_rel)
+                                 else round(float(np.median(both_rel)), 8)),
+        "ratio_logdiff_p90": (None if not len(both_rel)
+                              else round(float(np.quantile(both_rel, 0.90)), 8)),
+        "unit": "股票·日（同一交易日多只票算多次）",
+        "definition": "两序列相邻比；推算侧跳变里真实侧同日也跳的比例与倍数偏差",
+    }
+
+
+def _jump_sentence(ja: dict) -> str:
+    """把"跳变到底是真实事件还是脏数据"按实测比例写成一句话。
+
+    旧稿写死"12/14 抽样有事件对应"，那是 004B-P 的 14 次人工抽样；现在有全样本
+    逐日对拍，就该报全样本比例 —— 否则数字永远停在旧抽样上。
+    """
+    if not ja or not ja.get("available"):
+        return "。跳变与真实股本事件的对应关系见产物 size_compare.jump_agreement。"
+    both = ja.get("both_jump_ratio")
+    cov = ja.get("real_coverage")
+    if not isinstance(both, (int, float)):
+        return "。跳变与真实股本事件的对应关系见产物 size_compare.jump_agreement。"
+    head = (f"。**推算侧跳变里有 {both:.1%} 真实股本同日也跳**"
+            f"（{ja.get('both_jump_cells')}/{ja.get('jump_cells')} 个股票·日，"
+            f"真实股本覆盖 {cov:.2%}）—— 这些是真实解禁/增发，不是数据错误；"
+            f"剩下 {1 - both:.1%} 才是脏跳变（低换手日换手率舍入、停牌复牌）。")
+    return head
+
+
+def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = None,
+                        turn_missing: dict | None = None,
+                        neu: dict | None = None, size_cmp: dict | None = None,
+                        jump_agree: dict | None = None,
+                        fundamentals: dict | None = None) -> str:
+    """失效声明（审计-B6-04：数字全部从实测产物取，不再写死）。
+
+    任何一处拿不到实测值，就写"见产物字段 X"，**绝不回填旧数字** ——
+    旧版把 8,628 行 / 0.12pp / "<0.01%" 写进字符串，改了默认值产物照样说旧话。
+    """
+    p = ["本报告是因子刻画结果，不构成策略有效性或 alpha 证据。"]
+
+    if neu and neu.get("enabled"):
+        p.append(f"① 分层为层内等权、月度再平衡；**已产出行业中性化对照版**"
+                 f"（申万 {neu.get('level', INDUSTRY_LEVEL)} 级、{neu.get('method')}、"
+                 f"组内 <{MIN_GROUP_SIZE} 只不处理），两组结果分列 segments / "
+                 f"segments_neutralized。中性化只作用于截面日，非截面日不处理。")
+    else:
+        p.append("① 分层为层内等权、月度再平衡，未做行业/风格中性化（本报告未启用中性化）。")
+
+    p.append("② IC 用理论开盘价收益，未扣除涨跌停/停牌造成的不可成交 —— "
+             "IC 与分层收益之间允许有口径差，两者不可互相校验到小数位。")
+
+    if size_jump:
+        ex = (size_jump.get("examples") or [{}])[0]
+        p.append(
+            f"③ size 口径：本报告同时给 `size`（换手率推算）与 `size_real`（真实股本）两列，"
+            f"差异分布见 size_compare（月度截面中位 "
+            f"{(size_cmp or {}).get('dev', {}).get('median_abs', float('nan')):.4f}、"
+            f"p90 {(size_cmp or {}).get('dev', {}).get('p90_abs', float('nan')):.4f}）。"
+            f"推算口径的跳变实测 {size_jump.get('rows')} 行 / {size_jump.get('codes')} 只，"
+            f"其中 {size_jump.get('month_end_rows')} 行落在月末 "
+            f"{size_jump.get('month_end_window_days')} 日窗口内"
+            + (f"（例 {ex.get('code')} {ex.get('date')} ×{ex.get('share_ratio')}）"
+               if ex.get('code') else "")
+            + (_jump_sentence(jump_agree) if jump_agree else
+               "。这些跳变是否对应真实股本事件见产物 size_compare.jump_agreement。"))
+    else:
+        p.append("③ size 口径两种并列（size / size_real），跳变统计见产物 size_jump_stats。")
+
+    if turn_missing:
+        _wy = turn_missing.get("worst_year")
+        _wrate = (turn_missing.get("by_year", {}).get(_wy) or {}).get("rate")
+        p.append(f"④ turn 缺失 {_f(turn_missing.get('rate'), '.4%')}"
+                 f"（{turn_missing.get('missing')} 行），"
+                 f"最差年份 {_wy}（{_f(_wrate, '.4%')}）；"
+                 f"缺失行 100% 是停牌行（all_suspended={turn_missing.get('all_suspended')}）。")
+    else:
+        p.append("④ turn 缺失率见产物 data_quality.turn_missing。")
+
+    if fundamentals:
+        _rate = fundamentals.get("pubdate_missing_rate")
+        _rate_s = f"{_rate:.2%}" if isinstance(_rate, (int, float)) else "未知"
+        _epsc = fundamentals.get("epsTTM_coverage")
+        _eps_s = f"{_epsc:.2%}" if isinstance(_epsc, (int, float)) else "未统计"
+        _unres = fundamentals.get("pubdate_unresolved_rows")
+        _unres_s = (f"；另 {_unres} 行两个公告日字段都缺、整行剔除" if _unres else "")
+        p.append(f"⑤ 质量因子用公告日对齐：可用 {fundamentals.get('rows_usable')} 行 / "
+                 f"{fundamentals.get('codes')} 只；其中 "
+                 f"{fundamentals.get('pubdate_missing_rows')} 行"
+                 f"（{_rate_s}）没有实际公告日，"
+                 f"回退法定披露截止日推算{_unres_s} —— 存在**残余前视**，"
+                 f"这部分不能当作严格样本外。"
+                 f"epsTTM 覆盖率 {_eps_s}，未用作因子。")
+    else:
+        p.append("⑤ 质量因子时点口径见产物 data.fundamentals。")
+
+    p.append("⑥ 截面已剔除 ST/停牌/hfq 缺口/上市不足 60 日；holdout 段仅 12 个月、11 期 IC，"
+             "样本量不足以支撑统计推断，只作记录，不作结论。")
+
+    if lot and lot.get("available"):
+        p.append(
+            f"⑦ **层间比较有效，绝对水平不可与全市场等权直接相比**。整手残差实测"
+            f"（5 层各 1/5 资金合并 vs 全截面等权，同引擎同成本同 mask）：月差 "
+            f"mean|diff|={lot.get('mean_abs_pp')}pp、中位 {lot.get('median_abs_pp')}pp、"
+            f"p90 {lot.get('p90_abs_pp')}pp，signed 年化 {lot.get('signed_ann_pp')}pp；"
+            f"每层部分成交缺口 {lot.get('partial_gap_min_pct')}%~{lot.get('partial_gap_max_pct')}%；"
+            f"未投入现金最大 {lot.get('cash_max_pct')}%（中位 {lot.get('cash_median_pct')}%）——"
+            f"旧稿称未投入现金几乎为零，与实测不符，已按实测更正"
+            f"（残差主体是「配不满」，不是「留了一笔现金」，但现金确实有峰值）。")
+    else:
+        p.append("⑦ 整手残差见产物 segments.*.lot_residual（本报告该项不可用）。")
+
+    p.append("⑧ 月频 IC 存在自相关，t 值会**高估**显著性，只作量级参考 —— 不以 |t|>2 判定因子"
+             "有效，也不以「唯一 |t|>3」作结论支点（同表常有动量同样过线）。严格检验需 "
+             "Newey-West 或 block bootstrap，本报告未做。")
+    p.append("策略有效性判断须待后续样本外验证，不以本报告为准。")
+    return "\n".join(p)
 
 
 def build_report(fd: FactorData, factors: dict[str, np.ndarray],
                  args: argparse.Namespace, cfg_template: Config | None = None,
-                 data_quality: dict | None = None) -> dict:
-    """一次性生成 dev + holdout 两段报告（因子定义只算一遍，两段共用）。
+                 data_quality: dict | None = None,
+                 neutralize_variants: bool = True) -> dict:
+    """一次性生成 dev + holdout 两段报告，并产出行业中性化对照版。
 
     cfg_template 不给时按 args.cash / args.seed 造一个默认 Config；
     测试与复算可传入自定义模板（改 lot_size / costs 必须能在产物里看见，B5-06）。
@@ -1118,6 +1796,7 @@ def build_report(fd: FactorData, factors: dict[str, np.ndarray],
     bounds = segment_bounds(fd.dates)
     tmpl = cfg_template or Config(start=fd.dates[0], end=fd.dates[-1],
                                   init_cash=args.cash, seed=args.seed)
+    method = getattr(args, "neutralize_method", "demean")
 
     segs = {}
     for tag, (i0, i1) in bounds.items():
@@ -1129,9 +1808,70 @@ def build_report(fd: FactorData, factors: dict[str, np.ndarray],
     # 参数一律取实际生效的那份 Config（B5-06：改默认值必须让产物可见）
     eff = _layer_cfg(fd, *bounds["dev"], tmpl)
 
+    # ---- 行业中性化对照版
+    neu_segs = None
+    neu_meta: dict = {"enabled": False}
+    if neutralize_variants and fd.industry_gid is not None:
+        neu_segs = {}
+        for tag, (i0, i1) in bounds.items():
+            neu_segs[tag] = evaluate_segment(factors, fd, i0, i1, tmpl, args.layers,
+                                             neutralize=True, gids=fd.industry_gid,
+                                             method=method)
+        ist = (fd.source.get("industry") or {})
+        neu_meta = {"enabled": True, "method": method,
+                    "level": ist.get("level", INDUSTRY_LEVEL),
+                    "groups": ist.get("groups"),
+                    "min_group": MIN_GROUP_SIZE,
+                    "codes_coverage": ist.get("codes_coverage"),
+                    "cells_unmapped": ist.get("cells_unmapped")}
+        neu_meta["compare"] = {
+            tag: {k: {"ic_before": segs[tag][k]["ic_mean"],
+                      "ic_after": neu_segs[tag][k]["ic_mean"],
+                      "delta_ic": float(neu_segs[tag][k]["ic_mean"]
+                                        - segs[tag][k]["ic_mean"]),
+                      "t_before": segs[tag][k]["t_stat"],
+                      "t_after": neu_segs[tag][k]["t_stat"],
+                      "ls_before": segs[tag][k]["long_short_ann"],
+                      "ls_after": neu_segs[tag][k]["long_short_ann"],
+                      "q1_after": neu_segs[tag][k]["layer_ann"][0],
+                      "q5_after": neu_segs[tag][k]["layer_ann"][-1]}
+                  for k in factor_keys}
+            for tag in ("dev", "holdout")}
+
+    # ---- 新旧 size 口径对拍
+    size_cmp: dict = {"available": False}
+    if "size" in factors and "size_real" in factors:
+        size_cmp = {"available": True,
+                    "jump_agreement": share_jump_agreement(fd),
+                    "sections": {}}
+        for tag, (i0, i1) in bounds.items():
+            ends = [i for i in month_end_indices(fd.dates) if i0 <= i < i1]
+            size_cmp["sections"][tag] = size_cross_check(
+                fd, factors["size"], factors["size_real"], ends)
+        size_cmp["sections"]["ic"] = {
+            tag: {"size": segs[tag]["size"]["ic_mean"],
+                  "size_real": segs[tag]["size_real"]["ic_mean"],
+                  "t_size": segs[tag]["size"]["t_stat"],
+                  "t_size_real": segs[tag]["size_real"]["t_stat"],
+                  "ls_size": segs[tag]["size"]["long_short_ann"],
+                  "ls_size_real": segs[tag]["size_real"]["long_short_ann"]}
+            for tag in ("dev", "holdout")}
+
+    dq = data_quality or {}
+    # 现金残差取**第一个可用**的因子：写死 "bp" 时，别的因子单独跑（如只跑 rank）
+    # 会拿到空 dict，免责里退回"本报告该项不可用"，与产物字段对不上。
+    lot0 = next((segs["dev"][k]["lot_residual"] for k in factor_keys
+                 if segs["dev"][k].get("lot_residual", {}).get("available")), {})
+    note = build_validity_note(
+        size_jump=dq.get("size_jump"), lot=lot0,
+        turn_missing=dq.get("turn_missing"),
+        neu={**neu_meta, "method": method} if neu_meta.get("enabled") else None,
+        size_cmp=size_cmp.get("sections", {}),
+        jump_agree=size_cmp.get("jump_agreement"),
+        fundamentals=fd.source.get("fundamentals"))
+
     return {
-        "git_commit": _git_commit(),
-        "generated_at": pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        **_git_meta(),
         "params": {
             "factors": factor_keys,
             "n_layers": args.layers,
@@ -1154,29 +1894,50 @@ def build_report(fd: FactorData, factors: dict[str, np.ndarray],
             "min_xsec": MIN_XSEC,
             "dev_end": DEV_END,
             "holdout_start": HOLDOUT_START,
+            "neutralize": neu_meta,
             "factor_defs": {
                 "momentum_20": "close_hfq(T-1)/close_hfq(T-21)-1",
                 "momentum_60": "close_hfq(T-1)/close_hfq(T-61)-1",
                 "ep": "1/peTTM(T-1)",
                 "bp": "1/pbMRQ(T-1)",
-                "size": "log(close(T-1)*volume(T-1)/(turn(T-1)/100))",
+                "size": "log(close(T-1)*volume(T-1)/(turn(T-1)/100))  # 推算口径",
+                "size_real": "log(close(T-1)*float_share(T-1))  # 真实股本口径",
+                "roe_ttm": "净利润TTM/期末股东权益，取公告日 ≤ T-1 的最新一期",
+                "yoy_ni": "净利润同比（%），公告日对齐",
+                "debt_ratio": "资产负债率（%），公告日对齐",
             },
         },
         "data": fd.source,
-        "size_jump_stats": (data_quality or {}).get("size_jump", {}),
-        "data_quality": data_quality or {},
+        "size_jump_stats": dq.get("size_jump", {}),
+        "data_quality": dq,
         "segments": segs,
+        "segments_neutralized": neu_segs,
+        "neutralization_compare": neu_meta,
+        "size_compare": size_cmp,
         "layer_shape": {tag: {k: _layer_shape(v["layer_ann"])
                               for k, v in segs[tag].items() if not k.startswith("_")}
                         for tag in ("dev", "holdout")},
-        "readings": _readings(segs["dev"], segs["holdout"]),
+        "layer_shape_neutralized": ({tag: {k: _layer_shape(v["layer_ann"])
+                                           for k, v in neu_segs[tag].items()
+                                           if not k.startswith("_")}
+                                     for tag in ("dev", "holdout")}
+                                    if neu_segs else None),
+        "readings": _readings(segs["dev"], segs["holdout"],
+                              neu=neu_meta if neu_meta.get("enabled") else None,
+                              size_cmp=size_cmp.get("sections", {}),
+                              jump_agree=size_cmp.get("jump_agreement")),
         "size_source": SIZE_SOURCE,
-        "validity_note": VALIDITY_NOTE,
+        "size_source_real": SIZE_SOURCE_REAL,
+        "validity_note": note,
     }
 
 
 def write_report(report: dict, path: Path) -> Path:
-    """落盘 JSON。NaN 统一转 null，保证严格 JSON（下游不用猜）。"""
+    """落盘 JSON。NaN 统一转 null，保证严格 JSON（下游不用猜）。
+
+    落盘时补 `written_at` 与**落盘时刻的** HEAD —— 与 `code_commit`（生成时刻）
+    分开记，产物才能对上准确的代码版本（审计-B6-02）。
+    """
     def _clean(o):
         if isinstance(o, dict):
             return {k: _clean(v) for k, v in o.items()}
@@ -1193,10 +1954,25 @@ def write_report(report: dict, path: Path) -> Path:
             return bool(o)
         return o
 
+    report["written_at"] = pd.Timestamp.now().strftime("%Y-%m-%dT%H:%M:%S")
+    report["written_code_commit"] = _git_commit()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_clean(report), ensure_ascii=False, indent=2),
                     encoding="utf-8")
     return path
+
+
+def _f(x, spec: str = ".4f") -> str:
+    """表格数字格式化：None / NaN / inf 一律打 `n/a`。
+
+    因子在某些截面会算不出值（样本不足、股本缺失），直接 f"{x:.2%}" 会打出
+    `nan%`，那比留空更难读，也容易被人当成真实数字抄走。
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    return "n/a" if not np.isfinite(v) else format(v, spec)
 
 
 def print_summary(report: dict) -> None:
@@ -1208,9 +1984,13 @@ def print_summary(report: dict) -> None:
           f"{report['segments']['dev']['_meta']['end']}")
     print(f"holdout  : {report['segments']['holdout']['_meta']['start']} ~ "
           f"{report['segments']['holdout']['_meta']['end']}")
+    print(f"代码版本 : {report.get('code_commit', 'unknown')[:12]}"
+          f"（dirty={report.get('code_dirty')}）  "
+          f"生成 {report.get('generated_at')}")
     print("=" * 78)
-    for tag in ("dev", "holdout"):
-        seg = report["segments"][tag]
+
+    def _table(tag: str, segs: dict) -> None:
+        seg = segs[tag]
         meta = seg["_meta"]
         print(f"\n---------- {tag.upper()} ----------")
         print(f"截面 {meta['n_cross_sections']} 期 / 实际计入 IC {meta['n_ic_periods']} 期"
@@ -1220,38 +2000,79 @@ def print_summary(report: dict) -> None:
         for k, v in seg.items():
             if k.startswith("_"):
                 continue
-            print(f"{k:<14}{v['ic_mean']:>9.4f}{v['icir']:>8.3f}{v['t_stat']:>8.2f}"
-                  f"{v['ic_pos_ratio']:>7.3f}{v['n_periods']:>5}"
-                  f"{v['layer_ann'][0]:>9.2%}{v['layer_ann'][-1]:>9.2%}"
-                  f"{v['long_short_ann']:>9.2%}")
+            print(f"{k:<14}{_f(v['ic_mean']):>9}{_f(v['icir'], '.3f'):>8}"
+                  f"{_f(v['t_stat'], '.2f'):>8}{_f(v['ic_pos_ratio'], '.3f'):>7}"
+                  f"{v['n_periods']:>5}"
+                  f"{_f(v['layer_ann'][0], '.2%'):>9}"
+                  f"{_f(v['layer_ann'][-1], '.2%'):>9}"
+                  f"{_f(v['long_short_ann'], '.2%'):>9}")
         fx = meta.get("full_xsec") or {}
         if fx:
             ew = (meta.get("market_ew") or {}).get("ann_return")
             tail = f"；全市场 hfq 等权基准 {ew:.2%}" if ew is not None else ""
             print(f"全截面等权（同引擎）：年化 {fx['ann_return']:.2%}，"
                   f"{fx['n_rebalance']} 次调仓 / {fx['n_trades']} 笔{tail}")
-    r = report["segments"]["dev"]["bp"].get("lot_residual", {})
+
+    for tag in ("dev", "holdout"):
+        _table(tag, report["segments"])
+
+    neu = report.get("neutralization_compare") or {}
+    if neu.get("enabled") and report.get("segments_neutralized"):
+        print(f"\n---------- 行业中性化后（申万 {neu.get('level')} 级 / "
+              f"{neu.get('groups')} 组 / {neu.get('method')}） ----------")
+        for tag in ("dev", "holdout"):
+            print(f"[{tag}]")
+            print(f"{'因子':<14}{'IC前':>9}{'IC后':>9}{'ΔIC':>9}{'t前':>8}{'t后':>8}"
+                  f"{'多空前':>9}{'多空后':>9}")
+            for k, v in (neu.get("compare") or {}).get(tag, {}).items():
+                print(f"{k:<14}{_f(v['ic_before']):>9}{_f(v['ic_after']):>9}"
+                      f"{_f(v['delta_ic'], '+.4f'):>9}"
+                      f"{_f(v['t_before'], '.2f'):>8}{_f(v['t_after'], '.2f'):>8}"
+                      f"{_f(v['ls_before'], '.2%'):>9}"
+                      f"{_f(v['ls_after'], '.2%'):>9}")
+
+    sc = report.get("size_compare") or {}
+    if sc.get("available"):
+        ja = sc.get("jump_agreement") or {}
+        print("\n---------- size 新旧口径 ----------")
+        for tag in ("dev", "holdout"):
+            s = (sc.get("sections") or {}).get(tag) or {}
+            if s.get("available"):
+                print(f"[{tag}] 月截面 {s['n_points']} 点：市值相对差 "
+                      f"中位 {_f(s['median_abs'])} / p90 {_f(s['p90_abs'])} / "
+                      f"最大 {_f(s['max_abs'])}；"
+                      f">30% 占 {_f(s['share_gt30pct'], '.2%')}")
+        if ja.get("available"):
+            print(f"解禁跳变：推算侧 {ja['jump_cells']} 个股票·日 / {ja['jump_codes']} 只，"
+                  f"其中真实侧同日也跳 {ja['both_jump_cells']} 个"
+                  f"（{ja['both_jump_ratio']:.1%}；真实股本覆盖 "
+                  f"{ja.get('codes_with_real_shares')}/{ja.get('codes_total')} 只），"
+                  f"倍数 log 差中位 {ja.get('ratio_logdiff_median')}")
+
+    dev = report["segments"]["dev"]
+    pick = next((k for k in dev if dev[k].get("lot_residual", {}).get("available")), "bp")
+    r = dev.get(pick, {}).get("lot_residual", {})
     if r.get("available"):
-        print(f"\n整手残差（dev·bp 为例）：月差 mean|diff|={r['mean_abs_pp']:.2f}pp / "
+        print(f"\n整手残差（dev·{pick} 为例）：月差 mean|diff|={r['mean_abs_pp']:.2f}pp / "
               f"中位 {r['median_abs_pp']:.2f}pp / p90 {r['p90_abs_pp']:.2f}pp，"
               f"signed 年化 {r['signed_ann_pp']:+.2f}pp；"
               f"每层部分成交缺口 {r['partial_gap_min_pct']:.2f}%~{r['partial_gap_max_pct']:.2f}%，"
-              f"未投入现金仅 {r['cash_min_pct']:.3f}%~{r['cash_max_pct']:.3f}%")
+              f"未投入现金 中位 {r.get('cash_median_pct')}% / 最大 {r['cash_max_pct']:.2f}%")
+
     print("\n---------- 怎么读（措辞随数字生成） ----------")
     for line in report.get("readings", []):
         print("· " + line)
-    print("\n" + VALIDITY_NOTE)
-
+    print("\n" + report.get("validity_note", ""))
 
 
 # ---------------------------------------------------------------- CLI
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="S3-Q1 因子研究框架（动量/价值/小市值）")
+        description="S3-Q2 因子研究框架（动量/价值/小市值/质量 + 行业中性化）")
     ap.add_argument("--start", default="2018-01-02")
     ap.add_argument("--end", default="2026-11-06")
-    ap.add_argument("--factors", default=",".join(FACTOR_DEFS),
+    ap.add_argument("--factors", default=",".join(DEFAULT_FACTORS),
                     help=f"逗号分隔，可选 {sorted(FACTOR_DEFS)}")
     ap.add_argument("--layers", type=int, default=N_LAYERS)
     ap.add_argument("--cash", type=float, default=1e8,
@@ -1259,9 +2080,17 @@ def main(argv: list[str] | None = None) -> int:
                          "分层退化成价格分层（1e8 时各层整手可行性 ≈100%%）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--out", default="out")
+    ap.add_argument("--industry-level", type=int, default=INDUSTRY_LEVEL,
+                    choices=[1, 2, 3],
+                    help="行业中性化层级（申万 1/2/3 级）；实际用到的组数看产物 "
+                         "industry.groups —— 组里没股票的不计入")
+    ap.add_argument("--neutralize-method", default="demean",
+                    choices=["demean", "zscore"])
+    ap.add_argument("--no-neutralize", action="store_true",
+                    help="跳过行业中性化对照版（只出未中性化，省一半时间）")
     ap.add_argument("--diag-data", action="store_true",
                     help="只跑数据质量统计（turn 缺失率 / 推算股本跳变 / 真实股本对拍）并打印，"
-                         "不进回测。对应 VALIDITY_NOTE 与 size_jump_stats 的复现命令")
+                         "不进回测。对应 validity_note 与 size_jump_stats 的复现命令")
     args = ap.parse_args(argv)
 
     if args.diag_data:
@@ -1271,9 +2100,15 @@ def main(argv: list[str] | None = None) -> int:
 
     names = [x.strip() for x in args.factors.split(",") if x.strip()]
     print(f"[1/4] 载入数据 {args.start} ~ {args.end} ...", flush=True)
-    fd = load_factor_data(args.start, args.end)
+    fd = load_factor_data(args.start, args.end, industry_level=args.industry_level)
+    sh = fd.source.get("shares") or {}
+    ind = fd.source.get("industry") or {}
+    fu = fd.source.get("fundamentals") or {}
     print(f"      {len(fd.codes)} 只 / {len(fd.dates)} 交易日 / "
           f"hfq 缺口 {fd.source['hfq_gap_rows'].get('rows', 0)} 行", flush=True)
+    print(f"      真实股本覆盖 {sh.get('codes_covered')}/{sh.get('codes_total')}"
+          f"（{sh.get('codes_coverage')}）、行业覆盖 {ind.get('codes_coverage')}"
+          f"（{ind.get('groups')} 组）、财报可用 {fu.get('rows_usable')} 行", flush=True)
 
     print("[2/4] 数据质量统计（turn 缺失 / 股本跳变 / 对拍）...", flush=True)
     dq = data_quality_stats(args.start, args.end)
@@ -1284,9 +2119,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[3/4] 计算因子 {names} ...", flush=True)
     factors = compute_factors(fd, names)
-
-    print("[4/4] IC + 分层回测（dev / holdout 两段）...", flush=True)
-    report = build_report(fd, factors, args, data_quality=dq)
+    print(f"[4/4] IC + 分层回测（dev / holdout"
+          f"{'，含中性化对照' if not args.no_neutralize else ''}）...", flush=True)
+    report = build_report(fd, factors, args, data_quality=dq,
+                          neutralize_variants=not args.no_neutralize)
     out = write_report(report, (Path(args.out) / "factors_report.json").resolve())
     print_summary(report)
     print(f"\n产物：{out}")
