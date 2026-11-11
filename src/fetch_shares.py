@@ -161,6 +161,11 @@ def fetch_one_share(code: str, *, retries: int = 3, interval: float = BASE_INTER
     这样"疑似限流"的降速能立刻生效。空表（新股无记录/北交所）视为成功但 0 行。
     """
     last_err = ""
+    # akshare 内部调 requests 时**没有超时**，实测会偶发整只股票卡死（首版跑到 200 只
+    # 都没写出第一个 checkpoint）。这里给 socket 兜一个全局超时，卡住就抛异常走重试，
+    # 否则一个坏请求能挂死整批 5,470 只。
+    import socket
+    socket.setdefaulttimeout(25)
     for attempt in range(1, retries + 1):
         try:
             import akshare as ak
@@ -191,9 +196,9 @@ def load_parts(parts_dir: Path | None = None) -> pd.DataFrame:
 
 
 def fetch_shares(codes: list[str], *, interval: float = BASE_INTERVAL,
-                 retries: int = 3, checkpoint_every: int = 200,
+                 retries: int = 3, checkpoint_every: int = 100,
                  limit: int | None = None, sleep=time.sleep,
-                 progress=print) -> dict:
+                 progress=None) -> dict:
     """全量抓取（或续抓）。只补台账里没成功的代码。
 
     降速逻辑（自适）：
@@ -202,6 +207,8 @@ def fetch_shares(codes: list[str], *, interval: float = BASE_INTERVAL,
       · 间隔到 MAX_INTERVAL 仍失败 3 次 → 该股记 failed，进失败清单，继续下一只
         （不整体退出：个别代码 404 不该毁掉 5,470 只的任务）。
     """
+    if progress is None:
+        progress = lambda m: print(m, flush=True)      # noqa: E731 —— 后台跑必须不缓冲
     SHARES_DIR.mkdir(parents=True, exist_ok=True)
     led = load_ledger()
     done = {c for c, v in led["stocks"].items() if v.get("status") == "ok"}
@@ -239,6 +246,10 @@ def fetch_shares(codes: list[str], *, interval: float = BASE_INTERVAL,
                 cur = max(BASE_INTERVAL, cur * 0.9)
                 ok_streak = 0
         sleep(cur)
+
+        if k % 25 == 0:
+            progress(f"  ... {k}/{len(todo)} ok={n_ok} fail={n_fail} 间隔={cur:.2f}s "
+                     f"{time.time()-t0:.0f}s")
 
         if k % checkpoint_every == 0:
             _write_part(buf, part_idx)
