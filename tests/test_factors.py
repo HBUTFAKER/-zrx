@@ -30,7 +30,8 @@ sys.path.insert(0, str(ROOT))
 from src.backtest import Config, Costs, Panel  # noqa: E402
 from src.factors import (DEV_END, HOLDOUT_START, MIN_LISTED_DAYS,  # noqa: E402
                          MIN_GROUP_SIZE, FactorData, _layer_shape, align_by_pubdate,
-                         bp, build_report, build_validity_note, compute_factors,
+                         bp, build_report, build_validity_note,
+                         cash_residual_distribution, compute_factors,
                          cross_section_mask, data_quality_stats, ep,
                          evaluate_segment, forward_returns, ic_periods, ic_summary,
                          load_factor_data, momentum, month_end_indices,
@@ -617,8 +618,14 @@ def test_validity_note_is_generated_from_stats():
                                  "share_ratio": 14.588}]},
         lot={"available": True, "mean_abs_pp": 0.12, "median_abs_pp": 0.07,
              "p90_abs_pp": 0.29, "signed_ann_pp": -0.42,
-             "partial_gap_min_pct": 0.70, "partial_gap_max_pct": 2.27,
-             "cash_median_pct": 0.01, "cash_max_pct": 3.88},
+             "partial_gap_min_pct": 0.70, "partial_gap_max_pct": 2.27},
+        # B7-01：现金不再取单因子，必须传跨因子分布
+        cash_dist={"available": True, "n_factors": 9,
+                   "median_pct_min": 0.0002, "median_pct_max": 0.325,
+                   "worst_factor": "momentum_20", "worst_cash_max_pct": 3.88,
+                   "n_factors_below_001pct": 7,
+                   "factors_below_001pct": ["ep", "bp", "size", "size_real",
+                                            "roe_ttm", "yoy_ni", "debt_ratio"]},
         turn_missing={"rate": 0.007131, "missing": 68953, "worst_year": "2018",
                       "all_suspended": True, "by_year": {"2018": {"rate": 0.046586}}},
         size_cmp={"dev": {"median_abs": 0.0001, "p90_abs": 0.0003}})
@@ -626,8 +633,10 @@ def test_validity_note_is_generated_from_stats():
     assert "3.88" in note, "未投入现金的最大值必须按实测写（B6-01 的 0.01% 已被证伪）"
     assert "sz.001289" in note and "14.588" in note
     assert "自相关" in note, "t 值高估的免责丢了"
-    assert "2~7%" not in note and "0.2~0.3pp" not in note and "<0.01%" not in note, \
-        "旧的失实表述不许回流"
+    assert "2~7%" not in note and "0.2~0.3pp" not in note, "旧的失实表述不许回流"
+    # "<0.01%" 本身可以是如实描述（另有 7 个因子不足 0.01%），要禁的是把它当全称
+    assert "未投入现金 <0.01%" not in note and "现金几乎为零" not in note, \
+        "把现金说成全局接近零的旧失实措辞不许回流"
 
     bare = build_validity_note()
     for token in ("8628", "8,628", "3.88", "0.12pp"):
@@ -952,8 +961,13 @@ def test_lot_residual_reports_cash_median_not_just_claim(tmp_path):
         "现金指标必须同时给中位/95 分位/最大，只报 min-max 才会写出失实的「<0.01%」"
     assert lot["cash_max_pct"] >= lot["cash_median_pct"] >= 0
     assert "0.01% 以下" not in rep["validity_note"]
-    assert f"{lot['cash_max_pct']}" in rep["validity_note"], \
+    cd = rep["cash_residual_distribution"]
+    assert cd["available"] and cd["n_factors"] == 1, \
+        "现金分布必须覆盖全部因子（本测试只跑一个因子，故 n_factors==1）"
+    assert str(cd["worst_cash_max_pct"]) in rep["validity_note"], \
         "免责里的现金数字必须与产物字段一致（动态生成）"
+    assert "按因子看" in rep["validity_note"], \
+        "B7-01：必须写明按因子看，不许拿单个因子代表全体"
 
 def test_jump_sentence_uses_measured_ratio_not_old_sample():
     """B6-04 续：跳变归因必须写全样本实测比例，不许再抄 004B-P 的「12/14」抽样。"""
@@ -965,3 +979,46 @@ def test_jump_sentence_uses_measured_ratio_not_old_sample():
     assert "12/14" not in txt
     # 未提供对拍结果时只指向产物字段，不编数字
     assert "jump_agreement" in _jump_sentence({"available": False})
+
+def test_cash_distribution_spans_all_factors_not_first():
+    """B7-01：未投入现金必须跨全部因子取范围，不许拿第一个因子代表全体。
+
+    实测分布两极：动量类层间最大中位 1.45%，bp/size/质量因子全期 <0.001%。
+    取第一个（momentum_20）就把 1.45% 说成全体水平 —— B6-01 整改就是这么翻车的。
+    """
+    seg = {
+        "_meta": {"start": "2025-01-02"},
+        "momentum_20": {"lot_residual": {"available": True, "cash_median_pct": 0.325,
+                                        "cash_p95_pct": 1.2402, "cash_max_pct": 1.4542}},
+        "bp": {"lot_residual": {"available": True, "cash_median_pct": 0.0004,
+                                "cash_p95_pct": 0.0006, "cash_max_pct": 0.0007}},
+        "size": {"lot_residual": {"available": True, "cash_median_pct": 0.0003,
+                                  "cash_p95_pct": 0.0005, "cash_max_pct": 0.0005}},
+        "rank_unavailable": {"lot_residual": {"available": False}},
+    }
+    cd = cash_residual_distribution(seg)
+    assert cd["available"] and cd["n_factors"] == 3, "不可用的因子不计入，_meta 不计入"
+    assert cd["median_pct_min"] == 0.0003 and cd["median_pct_max"] == 0.325, \
+        "必须给跨因子范围，不是单因子的一个数"
+    assert cd["worst_factor"] == "momentum_20"
+    assert cd["worst_cash_max_pct"] == 1.4542
+    assert cd["n_factors_below_001pct"] == 2
+    assert "_meta" not in cd["by_factor"]
+
+    # 全不可用时不许返回数字（宁可说不可用，也不填旧值）
+    assert cash_residual_distribution({"_meta": {}})["available"] is False
+
+
+def test_pubdate_fallback_is_lag_not_lookahead():
+    """B7-02：法定截止日必然 ≥ 真实披露日 —— 方向是滞后，说成"残余前视"是定性错误。
+
+    截止日（一季报 04-30 / 年报次年 04-30）永远晚于或等于真实公告，只可能晚知道。
+    定成"前视"会让人误以为多算了未来信息，方向正好相反。
+    """
+    note = build_validity_note(
+        fundamentals={"rows_usable": 151437, "codes": 5293,
+                      "pubdate_missing_rows": 16242, "pubdate_missing_rate": 0.0952,
+                      "pubdate_unresolved_rows": 0})
+    assert "滞后" in note
+    assert "不可能预知未来" in note, "方向论证必须写在免责里，不能只丢一个结论"
+    assert "残余前视" not in note, "B7-02：截止日推算不可能前视，这个定性必须消失"

@@ -44,8 +44,10 @@ dev 末截面 2025-10-31 的窗口是 2025-11-03 open → 2025-12-01 open，越�
 **绝不用 statDate**。T 日因子值 = 公告日 ≤ T 的最新一期；实现上先按公告日 as-of
 铺成逐日矩阵，再过 `_shift1`，等于"只用 ≤ T-1 已公告的财报"。
 `pubDate` 缺 17,199 行（9.79%），这些行的 `pubdate_src == "deadline_est"`，是用
-法定披露截止日推算的时点，可能晚于真实公告日 —— 会带来**残余前视**，如实写进产物
-`data.fundamentals.pubdate_src`，不做平滑。
+法定披露截止日推算的时点。**方向是滞后不是前视**：截止日（一季报 04-30 / 半年报
+08-31 / 三季报 10-31 / 年报次年 04-30）必然 ≥ 真实披露日，只可能晚知道、不可能预知
+未来；代价是这批期数晚一到两周才进截面，属**时点噪声**。审计-B7 用巨潮对照 50 例
+复核：0 例提前、平均滞后 8.8 天。如实写进产物 `data.fundamentals.pubdate_src`。
 
 roe_ttm 不用 `roeAvg`：它是**区间累计**口径（Q1 是三个月、Q4 是全年），直接进截面会让
 因子值随季度季节性摆动。这里改成 `净利润TTM / 期末股东权益`，TTM 由 4 个季度累计值
@@ -1349,6 +1351,59 @@ def lot_residual_stats(layer_navs: list[pd.DataFrame | None],
 
 # ---------------------------------------------------------------- 单段评估
 
+def cash_residual_distribution(seg_dev: dict) -> dict:
+    """跨**全部**因子汇总未投入现金（审计-B7-01）。
+
+    教训：B6-01 修「现金不是几乎为零」时，取了 `factor_keys` 里**第一个**因子的
+    lot_residual 写进免责 —— 第一个正好是动量类（1.45%），于是把动量类的峰值当成了
+    全体的水平。实测其余 7 个因子全期 <0.001%，两个方向都错（旧稿「<0.01%」被动量
+    类推翻，改完又拿动量类代表全体）。
+
+    所以这里必须给跨因子的**范围**，并点出最高的是哪个因子。
+
+    口径提醒：`cash_max_pct` 是「5 层各自的期中位现金」里的最大值，**不是单期最大
+    值**；单期极值看 lot_residual.layer_cash_pct（5 个数的明细）。
+    """
+    rows = {}
+    for k, v in seg_dev.items():
+        if k.startswith("_"):
+            continue
+        lr = (v or {}).get("lot_residual") or {}
+        if not lr.get("available"):
+            continue
+        rows[k] = {c: lr.get(c) for c in
+                   ("cash_median_pct", "cash_p95_pct", "cash_max_pct")}
+    if not rows:
+        return {"available": False, "reason": "no_lot_residual"}
+
+    meds = [r["cash_median_pct"] for r in rows.values()
+            if r["cash_median_pct"] is not None]
+    maxs = [r["cash_max_pct"] for r in rows.values() if r["cash_max_pct"] is not None]
+    if not maxs:
+        return {"available": False, "reason": "no_cash_pct"}
+
+    worst = max(rows, key=lambda k: rows[k]["cash_max_pct"] if
+                rows[k]["cash_max_pct"] is not None else -1.0)
+    tiny = sorted(k for k, r in rows.items()
+                  if (r["cash_max_pct"] or 0.0) < 0.01)
+    return {
+        "available": True,
+        "n_factors": len(rows),
+        "median_pct_min": round(float(min(meds)), 6) if meds else None,
+        "median_pct_max": round(float(max(meds)), 6) if meds else None,
+        "max_pct_min": round(float(min(maxs)), 6),
+        "max_pct_max": round(float(max(maxs)), 6),
+        "worst_factor": worst,
+        "worst_cash_max_pct": round(float(rows[worst]["cash_max_pct"]), 6),
+        "n_factors_below_001pct": len(tiny),
+        "factors_below_001pct": tiny,
+        "by_factor": rows,
+        "definition": "未投入现金 = 1−(权益−现金)/权益，各期取中位；此处跨全部因子取"
+                      "范围并点名最高因子。cash_max_pct 是 5 层「期中位数」的最大值，"
+                      "不是单期最大值（单期极值见 lot_residual.layer_cash_pct）",
+    }
+
+
 def evaluate_segment(factors: dict[str, np.ndarray], fd: FactorData,
                      i0: int, i1: int, cfg_template: Config,
                      n_layers: int = N_LAYERS, *, neutralize: bool = False,
@@ -1694,6 +1749,7 @@ def _jump_sentence(ja: dict) -> str:
 
 
 def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = None,
+                        cash_dist: dict | None = None,
                         turn_missing: dict | None = None,
                         neu: dict | None = None, size_cmp: dict | None = None,
                         jump_agree: dict | None = None,
@@ -1754,8 +1810,10 @@ def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = Non
                  f"{fundamentals.get('codes')} 只；其中 "
                  f"{fundamentals.get('pubdate_missing_rows')} 行"
                  f"（{_rate_s}）没有实际公告日，"
-                 f"回退法定披露截止日推算{_unres_s} —— 存在**残余前视**，"
-                 f"这部分不能当作严格样本外。"
+                 f"回退法定披露截止日推算{_unres_s} —— 截止日必然 ≥ 真实披露日，"
+                 f"方向是**滞后**（只可能晚知道、不可能预知未来），代价是这批期数"
+                 f"晚一到两周才进截面，属时点噪声而非前视；审计-B7 巨潮对照 50 例"
+                 f"复核 0 例提前、平均滞后 8.8 天。"
                  f"epsTTM 覆盖率 {_eps_s}，未用作因子。")
     else:
         p.append("⑤ 质量因子时点口径见产物 data.fundamentals。")
@@ -1764,15 +1822,28 @@ def build_validity_note(*, size_jump: dict | None = None, lot: dict | None = Non
              "样本量不足以支撑统计推断，只作记录，不作结论。")
 
     if lot and lot.get("available"):
+        cash = cash_dist or {}
+        if cash.get("available"):
+            # B7-01：现金必须按全因子分布报。取单个因子（尤其排第一的动量类）
+            # 会同时犯两个方向的错，见 cash_residual_distribution 的注释。
+            cash_s = (f"**未投入现金按因子看**（{cash['n_factors']} 个因子）：各层期中位 "
+                      f"{cash['median_pct_min']}%~{cash['median_pct_max']}%，"
+                      f"最高是 `{cash['worst_factor']}`（层间最大中位 "
+                      f"{cash['worst_cash_max_pct']}%）；另有 "
+                      f"{cash['n_factors_below_001pct']} 个因子全期 <0.01%。"
+                      f"取单一因子代表全体两个方向都会错（旧稿把它说成几乎为零，"
+                      f"被动量类推翻；改完又拿动量类的峰值代表全体）—— 故给全因子范围。")
+        else:
+            cash_s = (f"未投入现金见产物 cash_residual_distribution"
+                      f"（本报告该项不可用，不填旧数字）。")
         p.append(
             f"⑦ **层间比较有效，绝对水平不可与全市场等权直接相比**。整手残差实测"
             f"（5 层各 1/5 资金合并 vs 全截面等权，同引擎同成本同 mask）：月差 "
             f"mean|diff|={lot.get('mean_abs_pp')}pp、中位 {lot.get('median_abs_pp')}pp、"
             f"p90 {lot.get('p90_abs_pp')}pp，signed 年化 {lot.get('signed_ann_pp')}pp；"
-            f"每层部分成交缺口 {lot.get('partial_gap_min_pct')}%~{lot.get('partial_gap_max_pct')}%；"
-            f"未投入现金最大 {lot.get('cash_max_pct')}%（中位 {lot.get('cash_median_pct')}%）——"
-            f"旧稿称未投入现金几乎为零，与实测不符，已按实测更正"
-            f"（残差主体是「配不满」，不是「留了一笔现金」，但现金确实有峰值）。")
+            f"每层部分成交缺口 {lot.get('partial_gap_min_pct')}%~{lot.get('partial_gap_max_pct')}%。"
+            + cash_s
+            + "残差主体是「配不满」，不是「留了一笔现金」。")
     else:
         p.append("⑦ 整手残差见产物 segments.*.lot_residual（本报告该项不可用）。")
 
@@ -1862,8 +1933,9 @@ def build_report(fd: FactorData, factors: dict[str, np.ndarray],
     # 会拿到空 dict，免责里退回"本报告该项不可用"，与产物字段对不上。
     lot0 = next((segs["dev"][k]["lot_residual"] for k in factor_keys
                  if segs["dev"][k].get("lot_residual", {}).get("available")), {})
+    cash_dist = cash_residual_distribution(segs["dev"])
     note = build_validity_note(
-        size_jump=dq.get("size_jump"), lot=lot0,
+        size_jump=dq.get("size_jump"), lot=lot0, cash_dist=cash_dist,
         turn_missing=dq.get("turn_missing"),
         neu={**neu_meta, "method": method} if neu_meta.get("enabled") else None,
         size_cmp=size_cmp.get("sections", {}),
@@ -1909,6 +1981,7 @@ def build_report(fd: FactorData, factors: dict[str, np.ndarray],
         },
         "data": fd.source,
         "size_jump_stats": dq.get("size_jump", {}),
+        "cash_residual_distribution": cash_dist,
         "data_quality": dq,
         "segments": segs,
         "segments_neutralized": neu_segs,
@@ -2056,8 +2129,14 @@ def print_summary(report: dict) -> None:
         print(f"\n整手残差（dev·{pick} 为例）：月差 mean|diff|={r['mean_abs_pp']:.2f}pp / "
               f"中位 {r['median_abs_pp']:.2f}pp / p90 {r['p90_abs_pp']:.2f}pp，"
               f"signed 年化 {r['signed_ann_pp']:+.2f}pp；"
-              f"每层部分成交缺口 {r['partial_gap_min_pct']:.2f}%~{r['partial_gap_max_pct']:.2f}%，"
-              f"未投入现金 中位 {r.get('cash_median_pct')}% / 最大 {r['cash_max_pct']:.2f}%")
+              f"每层部分成交缺口 {r['partial_gap_min_pct']:.2f}%~{r['partial_gap_max_pct']:.2f}%")
+        cd = report.get("cash_residual_distribution") or {}
+        if cd.get("available"):
+            print(f"未投入现金（全部 {cd['n_factors']} 个因子）：层期中位 "
+                  f"{cd['median_pct_min']}%~{cd['median_pct_max']}%，最高 "
+                  f"{cd['worst_factor']} {cd['worst_cash_max_pct']}%；"
+                  f"{cd['n_factors_below_001pct']} 个因子全期 <0.01%"
+                  f"（口径：层间最大中位数，非单期极值）")
 
     print("\n---------- 怎么读（措辞随数字生成） ----------")
     for line in report.get("readings", []):

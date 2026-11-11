@@ -241,3 +241,25 @@ def test_coverage_reports_first_event_after_panel_start(sandbox, monkeypatch):
     cov = fs.coverage_report(panel_codes=["sh.688783"], panel_start="2018-01-02")
     assert cov["shares"]["first_event_after_panel_start"] == 1, \
         "事件起点晚于面板起点必须单独计数（那段日子没有真实股本可用）"
+
+def test_socket_timeout_is_scoped_and_restored():
+    """审计-B7 安全条件：socket 超时必须是**局部**副作用，退出即还原。
+
+    旧实现直接在 fetch_one_share 里 socket.setdefaulttimeout(25)，是进程级的 ——
+    5,267 次调用每次都改全局，同进程的 pytest / 其它库连接会被一起改掉且没人还原。
+    """
+    import socket
+    from src.fetch_shares import _socket_timeout
+
+    before = socket.getdefaulttimeout()
+    with _socket_timeout(7.0):
+        assert socket.getdefaulttimeout() == 7.0
+    assert socket.getdefaulttimeout() == before, "正常退出必须恢复原值"
+
+    # 异常路径同样要恢复（抓取里超时就是靠抛异常走的）
+    try:
+        with _socket_timeout(3.0):
+            raise TimeoutError("boom")
+    except TimeoutError:
+        pass
+    assert socket.getdefaulttimeout() == before, "异常退出也必须恢复原值"

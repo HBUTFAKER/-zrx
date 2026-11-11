@@ -45,8 +45,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import socket
 import time
+import warnings
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
@@ -153,6 +156,26 @@ def parse_share_frame(raw: pd.DataFrame, code: str) -> pd.DataFrame:
     return out
 
 
+#: 单次接口调用的 socket 超时（秒）。aks 内部无超时，必须自己兜。
+SOCKET_TIMEOUT = 25.0
+
+
+@contextlib.contextmanager
+def _socket_timeout(seconds: float):
+    """临时设置 socket 默认超时，退出时恢复原值（审计-B7 安全条件）。
+
+    `socket.setdefaulttimeout` 是**进程级**的：直接在函数里设一次，同进程后续所有
+    socket（pytest、其它库、调用方自己的连接）都会继承这个超时，且没人负责还原。
+    收窄成 with 块，作用域只覆盖一次接口调用。
+    """
+    old = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    try:
+        yield
+    finally:
+        socket.setdefaulttimeout(old)
+
+
 def fetch_one_share(code: str, *, retries: int = 3, interval: float = BASE_INTERVAL,
                     sleep=time.sleep) -> tuple[pd.DataFrame | None, int, str]:
     """抓一只股票的股本事件。返回 (表|None, 尝试次数, 错误信息)。
@@ -161,15 +184,16 @@ def fetch_one_share(code: str, *, retries: int = 3, interval: float = BASE_INTER
     这样"疑似限流"的降速能立刻生效。空表（新股无记录/北交所）视为成功但 0 行。
     """
     last_err = ""
-    # akshare 内部调 requests 时**没有超时**，实测会偶发整只股票卡死（首版跑到 200 只
-    # 都没写出第一个 checkpoint）。这里给 socket 兜一个全局超时，卡住就抛异常走重试，
-    # 否则一个坏请求能挂死整批 5,470 只。
-    import socket
-    socket.setdefaulttimeout(25)
     for attempt in range(1, retries + 1):
         try:
             import akshare as ak
-            raw = ak.stock_zh_a_gbjg_em(symbol=to_em_symbol(code))
+            # akshare 内部调 requests 时**没有超时**，实测会偶发整只股票卡死（首版跑到
+            # 200 只都没写出第一个 checkpoint）。这里给 socket 兜超时，卡住就抛异常走
+            # 重试，否则一个坏请求能挂死整批 5,470 只。
+            # 审计-B7 安全条件：不能直接 socket.setdefaulttimeout —— 那是**进程级**副作用，
+            # 会把同进程里测试/其它库的 socket 一起改掉。用上下文管理器，退出即恢复。
+            with _socket_timeout(SOCKET_TIMEOUT):
+                raw = ak.stock_zh_a_gbjg_em(symbol=to_em_symbol(code))
             df = parse_share_frame(raw, code)
             return df, attempt, ""
         except Exception as e:  # noqa: BLE001 —— 网络/限流/接口变更都走降速重试
@@ -291,10 +315,17 @@ def fetch_sw_xls(url: str = SW_XLS_URL, timeout: int = 60) -> pd.DataFrame:
     关闭校验 —— 数据源没变，只是绕开证书问题；总工已追认。
     """
     import requests
-    import urllib3
-    urllib3.disable_warnings()
-    r = requests.get(url, verify=False, timeout=timeout,
-                     headers={"User-Agent": "Mozilla/5.0"})
+    from urllib3.exceptions import InsecureRequestWarning
+
+    # 审计-B7 安全条件：`urllib3.disable_warnings()` 是**全局**的，会把整个进程里
+    # urllib3 的所有警告一起吞掉（包括别的库真正该看的告警）。只在这一个请求期间、
+    # 只压 InsecureRequestWarning 这一种。
+    # verify=False 的前提：URL 是申万宏源官方地址、写死为常量、不经用户输入；若将来
+    # 常态化使用，须改为内置 CA 或证书 pinning（审计-B7 条件原话）。
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", InsecureRequestWarning)
+        r = requests.get(url, verify=False, timeout=timeout,
+                         headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return pd.read_excel(BytesIO(r.content))
 
