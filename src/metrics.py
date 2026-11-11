@@ -66,15 +66,21 @@ def max_drawdown(s: pd.Series) -> dict:
 
 
 def sharpe(s: pd.Series, rf: float = RF) -> float:
+    """夏普 = (年化 − rf) / 年化波动。
+
+    护栏：波动率数值上等于 0（恒定收益序列，std 只差浮点噪声 ~1e-16）时返回 NaN。
+    不设这条护栏会得到 4.4e13 这种"极优"夏普 —— 那是浮点产物，不是业绩。
+    """
     v = ann_vol(s)
-    if not np.isfinite(v) or v <= 0:
+    if not np.isfinite(v) or v < 1e-12:
         return float("nan")
     return float((ann_return(s) - rf) / v)
 
 
 def calmar(s: pd.Series) -> float:
+    """卡玛 = 年化 / |最大回撤|；无回撤（含浮点噪声级回撤）时 NaN，不写 inf。"""
     m = max_drawdown(s)["mdd"]
-    if not np.isfinite(m) or m == 0:
+    if not np.isfinite(m) or abs(m) < 1e-12:
         return float("nan")
     return float(ann_return(s) / abs(m))
 
@@ -91,11 +97,20 @@ def yearly_returns(s: pd.Series) -> dict[str, float]:
     return out
 
 
+def _closed_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    """已平仓交易 = 主动卖出 + 退市强制清算。
+
+    清算（side='liquidate'）同样把仓位变成现金、实现盈亏，漏掉它会让胜率/盈亏比
+    只统计"跑掉了的"那些股票，退市股被静默排除 —— 正是生存偏差的另一种形态。
+    """
+    if trades is None or trades.empty or "side" not in trades.columns:
+        return pd.DataFrame()
+    return trades[trades["side"].isin(("sell", "liquidate"))]
+
+
 def win_rate(trades: pd.DataFrame) -> float:
-    """胜率：已平仓（卖出）交易中盈利笔数占比。"""
-    if trades is None or trades.empty:
-        return float("nan")
-    closed = trades[trades["side"] == "sell"]
+    """胜率：已平仓（卖出 + 清算）交易中盈利笔数占比。"""
+    closed = _closed_trades(trades)
     if closed.empty:
         return float("nan")
     return float((closed["pnl"] > 0).mean())
@@ -103,9 +118,7 @@ def win_rate(trades: pd.DataFrame) -> float:
 
 def profit_loss_ratio(trades: pd.DataFrame) -> float:
     """盈亏比：平均盈利 / 平均亏损（绝对值）。没有亏损笔时返回 NaN，不写 999。"""
-    if trades is None or trades.empty:
-        return float("nan")
-    closed = trades[trades["side"] == "sell"]
+    closed = _closed_trades(trades)
     if closed.empty:
         return float("nan")
     win = closed.loc[closed["pnl"] > 0, "pnl"]
