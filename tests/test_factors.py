@@ -27,10 +27,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.backtest import Config, Panel  # noqa: E402
-from src.factors import (DEV_END, HOLDOUT_START, MIN_LISTED_DAYS, FactorData,  # noqa: E402
-                         bp, compute_factors, cross_section_mask, ep,
-                         evaluate_segment, forward_returns, ic_summary,
+from src.backtest import Config, Costs, Panel  # noqa: E402
+from src.factors import (DEV_END, HOLDOUT_START, MIN_LISTED_DAYS,  # noqa: E402
+                         VALIDITY_NOTE, FactorData, _layer_shape, bp,
+                         build_report, compute_factors, cross_section_mask,
+                         data_quality_stats, ep, evaluate_segment,
+                         forward_returns, ic_periods, ic_summary,
                          load_factor_data, momentum, month_end_indices, rank_ic,
                          segment_bounds, size, split_layers)
 
@@ -70,14 +72,14 @@ def trade_days(start: str, n: int) -> list[str]:
 
 
 def build_rank_panel(n_codes: int = 20, n_months: int = 4, per_month: int = 21,
-                     spread: float = 0.002):
+                     spread: float = 0.002, start: str = "2020-01-02"):
     """构造「因子完全决定下期收益」的面板。
 
     每个月：第 j 只股票当月收益 = (j - (n/2-0.5)) × spread，严格按 j 递增。
     因子矩阵取常数 j（rank），因此 IC 必须 = 1，Q1..Q5 年化必须单调递增。
     """
     n_days = n_months * per_month
-    dates = trade_days("2020-01-02", n_days)
+    dates = trade_days(start, n_days)
     codes = [f"sh.{600000 + j}" for j in range(n_codes)]
     px = np.zeros((n_days, n_codes), dtype="float64")
     base = np.full(n_codes, 10.0)
@@ -473,3 +475,140 @@ def test_normal_cache_loads_and_shapes_align(tmp_path):
     assert fd.pe_ttm.shape == shp and fd.turn.shape == shp
     assert fd.listed_days.shape == shp
     assert len(fd.codes) == 100
+
+
+# ---------------------------------------------------------------- 6. 审计-B5 整改项
+def test_ic_periods_never_cross_segment_end():
+    """B5-01：dev 段任何计入 IC 的前瞻收益窗终点必须 ≤ DEV_END。
+
+    用边界日期硬断言，不做"大概不超过"：末截面 2025-10-31 的退出日算出来是
+    2025-12-01（越过 DEV_END 2025-11-06），这一期必须被丢弃并留下原因。
+    """
+    dates = trade_days("2025-09-01", 80)
+    codes = [f"sh.{600000 + j}" for j in range(3)]
+    px = np.full((len(dates), len(codes)), 10.0)
+    fd = make_factor_data(dates, codes, px, px)
+
+    dev_last = max(i for i, d in enumerate(dates) if d <= DEV_END)
+    i1 = dev_last + 1
+    usable, dropped = ic_periods(fd, 0, i1)
+
+    assert usable, "dev 段一期都没有，测试前提不成立"
+    for p in usable:
+        assert p["exit_date"] <= DEV_END, \
+            f"{p['cross_section']} 的 IC 窗口到 {p['exit_date']}，越过 {DEV_END} —— 吃了 holdout 收益"
+    crossed = [d for d in dropped if d["reason"] == "exit_beyond_segment_end"]
+    assert len(crossed) == 1, f"应恰好丢 1 期，实际 {dropped}"
+    last_end = max(i for i in month_end_indices(dates) if i < i1)
+    assert crossed[0]["cross_section"] == dates[last_end], \
+        f"被丢的应是段内末截面 {dates[last_end]}，实际 {crossed[0]['cross_section']}"
+    assert crossed[0]["exit_date"] > DEV_END, "既然丢了，退出日必须真的越过边界"
+
+
+def test_dev_ic_period_count_real_data():
+    """B5-01 真实数据：dev 段 IC 期数比截面数少 1，且末截面被丢的原因是跨段。
+
+    这条锁死"dev 统计不消耗 holdout 收益"：截面 22 期、计入 IC 21 期。
+    """
+    fd = load_factor_data("2025-06-01", "2026-11-06")
+    b = segment_bounds(fd.dates)
+    usable, dropped = ic_periods(fd, *b["dev"])
+    ends = [i for i in month_end_indices(fd.dates) if b["dev"][0] <= i < b["dev"][1]]
+    assert len(usable) == len(ends) - 1, f"截面 {len(ends)} 期，计入 IC {len(usable)} 期"
+    assert all(p["exit_date"] <= DEV_END for p in usable)
+    reasons = [d["reason"] for d in dropped]
+    assert reasons == ["exit_beyond_segment_end"], f"丢弃原因异常：{reasons}"
+
+    res = evaluate_segment({"bp": compute_factors(fd, ["bp"])["bp"]}, fd,
+                           *b["dev"], Config(start=fd.dates[0], end=fd.dates[-1],
+                                             init_cash=1e6, seed=42), n_layers=5)
+    assert res["_meta"]["n_ic_periods"] == len(usable)
+    assert res["_meta"]["n_cross_sections"] == len(ends)
+    assert len(res["_meta"]["ic_periods_dropped"]) == 1, "产物里必须留痕"
+
+
+def test_layer_shape_matches_numbers():
+    """B5-07：分层形状必须从数字算，不能写死形容词。"""
+    s = _layer_shape([0.06, 0.05, 0.08, 0.10, 0.07])
+    assert s["max_layer"] == "Q4" and s["min_layer"] == "Q2"
+    assert s["max_ann"] == pytest.approx(0.10)
+    # 最大相邻落差在 Q4→Q5（10%→7%），不是 Q1→Q2（1pp）
+    assert s["max_adjacent_drop"]["from"] == "Q4" and s["max_adjacent_drop"]["to"] == "Q5"
+    assert s["max_adjacent_drop"]["pp"] == pytest.approx(3.0)
+
+
+def test_params_complete_and_reflect_cfg():
+    """B5-06：lot_size / max_positions / max_weight / costs 必须入档且取自实际 cfg。
+
+    改默认值必须让产物可见 —— 这里用 lot_size=200 + 滑点 0.2% 的模板跑一遍，
+    断言产物参数跟着变、分层年化**确实**变了（不是只改了标签）。
+    """
+    import argparse
+
+    dates, codes, px, fmat = build_rank_panel(n_codes=45, n_months=18, start="2025-06-02")
+    fd = make_factor_data(dates, codes, px, px)
+    args = argparse.Namespace(cash=1e6, seed=42, layers=5)
+
+    tmpl = Config(start=dates[0], end=dates[-1], init_cash=1e6, seed=42,
+                  lot_size=200, costs=Costs(slippage=0.002))
+    rep = build_report(fd, {"rank": fmat}, args, cfg_template=tmpl)
+    p = rep["params"]
+    assert p["lot_size"] == 200, f"lot_size 没入档：{p.get('lot_size')}"
+    assert p["max_positions"] == len(codes), "分层实际持有全部股票，须如实入档"
+    assert p["max_weight"] == 1.0
+    assert p["costs"]["slippage"] == pytest.approx(0.002), "costs 必须取自 cfg，不许写死"
+    assert p["costs"]["commission_rate"] == pytest.approx(0.00025)
+
+    tmpl2 = Config(start=dates[0], end=dates[-1], init_cash=1e6, seed=42,
+                   lot_size=100, costs=Costs(slippage=0.002))
+    rep2 = build_report(fd, {"rank": fmat}, args, cfg_template=tmpl2)
+    assert rep2["params"]["lot_size"] == 100
+    a1 = rep["segments"]["dev"]["rank"]["layer_ann"]
+    a2 = rep2["segments"]["dev"]["rank"]["layer_ann"]
+    assert not np.allclose(a1, a2, equal_nan=True), \
+        f"lot_size 100→200 分层收益完全没变，参数没真正生效：{a1} vs {a2}"
+
+
+def test_size_jump_stats_reproducible(tmp_path):
+    """B5-03：跳变统计口径可复现（合成数据手算对拍）。
+
+    合成 2 只股票 5 个交易日：A 在第 5 天（月末前 3 天）股本翻倍 → 记 1 跳且落进月末窗口；
+    B turn 缺失（停牌）→ 只进缺失率、不进跳变（不能与上一有效观测比出一个假跳）。
+    """
+    rows = []
+    for i, d in enumerate(["2020-01-27", "2020-01-28", "2020-01-29", "2020-01-30", "2020-01-31"]):
+        sh_a = 1e8 * (2.0 if i == 4 else 1.0)          # 第 5 天翻倍
+        rows.append({"code": "sh.600000", "date": d, "close": 10.0,
+                     "volume": sh_a * 0.01, "turn": 1.0, "suspended": False})
+        rows.append({"code": "sh.600001", "date": d, "close": 20.0,
+                     "volume": 0.0, "turn": np.nan, "suspended": True})
+    pd.DataFrame(rows).to_parquet(tmp_path / "daily_2020.parquet", index=False)
+
+    st = data_quality_stats("2020-01-01", "2020-12-31", cache_dir=tmp_path, month_end_days=7)
+    sj, tm = st["size_jump"], st["turn_missing"]
+    assert sj["rows"] == 1, f"应恰好 1 跳，实际 {sj['rows']}"
+    assert sj["codes"] == 1
+    assert sj["month_end_rows"] == 1, "2020-01-31 距月末 0 天，必须落进月末窗口"
+    assert tm["missing"] == 5 and tm["rate"] == pytest.approx(0.5)
+    assert tm["all_suspended"] is True, "缺失行全部是停牌行"
+    assert st["scope"]["codes"] == 2
+
+
+def test_validity_note_carries_current_numbers():
+    """B5-02：失效的旧数字必须从 VALIDITY_NOTE 里消失，新的实测数字必须在。
+
+    "2~7% 残差"、"0.2~0.3pp/月" 都是审计-B5 指出与实测不符的表述；
+    "2.25pp" 必须保留但必须带"标签错误"的更正说明，否则下次又会被当成结论引用。
+    """
+    assert "2~7%" not in VALIDITY_NOTE, "旧的「每层留 2~7% 残差」还在"
+    assert "0.2~0.3pp" not in VALIDITY_NOTE, "旧的「差约 0.2~0.3pp/月」还在"
+    assert "8,628" in VALIDITY_NOTE and "3,693" in VALIDITY_NOTE, "跳变量化未写进免责"
+    assert "标签错误" in VALIDITY_NOTE, "2.25pp 的更正说明丢了"
+    assert "自相关" in VALIDITY_NOTE, "t 值高估的免责丢了"
+
+
+def test_ic_summary_docstring_warns_autocorrelation():
+    """B5-07③：t 值的自相关免责必须写在 ic_summary 里，不能只写在报告正文。"""
+    doc = ic_summary.__doc__ or ""
+    assert "自相关" in doc and "高估" in doc
+    assert "Newey" in doc or "bootstrap" in doc, "免责要给出替代做法，不然只是免责不改正"
