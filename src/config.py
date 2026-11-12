@@ -82,24 +82,23 @@ DEFAULT_SYSTEM: dict = {
         "expected_positions_comment": "预期持仓只数区间，只用于卡上提示，不构成门槛（不调档迁就）。",
     },
     "gate": {
-        "_comment": "硬门槛（005R 更新版）：全部通过才出建议卡，任一不过输出 fallback。",
+        "_comment": "硬门槛（004C）：forced / 全段组合绝对回撤 / 五年滚动稳定性，任一不过输出 fallback。",
         "dev_min_excess": 0.0,
-        "dev_comment": "dev 段超额（对可投池等权）必须 > 本值。",
-        "period_max_dd_worse": 0.10,
-        "period_comment": "分年各期与 holdout 的回撤，不得比可投池等权深超过本值（10pp）。",
-        "holdout_check_direction": True,
-        "direction_comment": "方向检查**只在 dev 通过之后**才做；dev 不过即 fallback，不比方向。",
+        "dev_comment": "仅保留旧流程粗筛兼容项；004C 终验统一对 H00300。",
+        "max_portfolio_mdd": 0.15,
+        "min_avg_excess": 0.02,
+        "min_positive_windows": 4,
     },
     "validation": {
-        "_comment": "band 的定档段与准样本外分年（业主给的两选一，本单选分年冻结-后验："
-                    "band 是单个离散参数，按月重选主要增加噪声；分年 4 段已能回答"
-                    "'是不是只有某一年行'）。",
-        "method": "yearly_freeze",
-        "band_fit_end": "2021-12-31",
-        "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2021-12-31 共 48 个截面。",
-        "years": ["2022", "2023", "2024", "2025"],
-        "years_comment": "准样本外年份，逐年独立跑。2025 段自动截到 holdout.start 前一日"
-                         "（11 个月的短年，横向比较需注意）。",
+        "_comment": "24个月训练 / 12个月检验；因子与反转主窗口逐窗口冻结。",
+        "method": "rolling_24_12",
+        "band_fit_end": "2020-12-31",
+        "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2020-12-31 共 36 个截面。",
+        "years": ["2021", "2022", "2023", "2024", "2025"],
+        "years_comment": "滚动检验段为2021~2025，每段完整12个月；2025为完整年度。",
+        "train_months": 24,
+        "test_months": 12,
+        "factor_report": "out/004c_c1_factors.json",
     },
     "holdout": {
         "_comment": "holdout 段边界，冻结不许改（factors.DEV_END / HOLDOUT_START 同源）。",
@@ -267,22 +266,46 @@ def validate(cfg: dict) -> None:
     gate = system.get("gate") or {}
     if not isinstance(gate.get("dev_min_excess"), (int, float)):
         raise ConfigError("system.gate.dev_min_excess 必须是数字")
-    ddw = gate.get("period_max_dd_worse")
-    if not isinstance(ddw, (int, float)) or isinstance(ddw, bool) or not (0.0 <= ddw <= 1.0):
-        raise ConfigError(f"system.gate.period_max_dd_worse 必须在 [0, 1]，当前 {ddw!r}")
-
+    for key, lo, hi in (("max_portfolio_mdd", 0.0, 1.0),
+                        ("min_avg_excess", -1.0, 1.0)):
+        value = gate.get(key)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not lo <= value <= hi:
+            raise ConfigError(f"system.gate.{key} 必须在 [{lo}, {hi}]，当前 {value!r}")
+    positive_windows = gate.get("min_positive_windows")
+    if not isinstance(positive_windows, int) or isinstance(positive_windows, bool) or positive_windows < 1:
+        raise ConfigError("system.gate.min_positive_windows 必须是正整数")
     # ---------- system.validation ----------
     val = system.get("validation") or {}
-    if val.get("method") != "yearly_freeze":
-        raise ConfigError(
-            f"system.validation.method 目前只实现 'yearly_freeze'（分年冻结-后验），"
-            f"当前 {val.get('method')!r}。全滚动模式未实现，不许静默按分年跑。")
-    years = val.get("years")
-    if not isinstance(years, list) or not years:
-        raise ConfigError("system.validation.years 必须是非空列表（如 ['2022','2023']）")
-    for y in years:
-        if not (isinstance(y, str) and len(y) == 4 and y.isdigit()):
-            raise ConfigError(f"system.validation.years 每项必须是四位年份字符串，当前含 {y!r}")
+    method = val.get("method")
+    if method == "rolling_24_12":
+        if "period_max_dd_worse" in gate or "holdout_check_direction" in gate:
+            raise ConfigError("004C 已删除 period_max_dd_worse / holdout_check_direction，请按新模板更新")
+        if val.get("train_months") != 24 or val.get("test_months") != 12:
+            raise ConfigError("rolling_24_12 固定为 24 个月训练 / 12 个月检验")
+        if val.get("band_fit_end") != "2020-12-31":
+            raise ConfigError("004C 定档段必须截止 2020-12-31")
+        years = val.get("years")
+        if not isinstance(years, list) or any(not (isinstance(y, str) and len(y) == 4 and y.isdigit())
+                                              for y in years):
+            raise ConfigError("rolling_24_12 检验年份必须是四位年份字符串")
+        if years != ["2021", "2022", "2023", "2024", "2025"]:
+            raise ConfigError("rolling_24_12 检验年份必须是 2021~2025 五个完整年度")
+        if not isinstance(val.get("factor_report"), str) or not val["factor_report"]:
+            raise ConfigError("system.validation.factor_report 必须指定 C1 JSON 产物")
+    elif method == "yearly_freeze":
+        ddw = gate.get("period_max_dd_worse")
+        if not isinstance(ddw, (int, float)) or isinstance(ddw, bool) or not (0.0 <= ddw <= 1.0):
+            raise ConfigError(f"system.gate.period_max_dd_worse 必须在 [0, 1]，当前 {ddw!r}")
+        years = val.get("years")
+        if not isinstance(years, list) or not years:
+            raise ConfigError("system.validation.years 必须是非空列表（如 ['2022','2023']）")
+        for y in years:
+            if not (isinstance(y, str) and len(y) == 4 and y.isdigit()):
+                raise ConfigError(f"system.validation.years 每项必须是四位年份字符串，当前含 {y!r}")
+    elif method == "rolling":
+        raise ConfigError("system.validation.method 目前只实现 'rolling_24_12'，请使用该固定滚动口径")
+    else:
+        raise ConfigError(f"system.validation.method 未实现，当前 {method!r}")
 
     # ---------- veto / filters ----------
     veto = system.get("veto") or {}

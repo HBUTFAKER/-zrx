@@ -310,39 +310,51 @@ def build_universe(fd, i: int, system: dict, mats: dict[str, np.ndarray],
 
 def composite_scores(fd, i: int, uni: dict, system: dict,
                      mats: dict[str, np.ndarray],
-                     w_bp: float | None = None) -> dict:
-    """综合得分 = w·bp分位 + (1−w)·反转分位（反转分位 = 1 − momentum_20 分位）。
+                     w_bp: float | None = None,
+                     factor_names: list[str] | None = None) -> dict:
+    """按指定因子截面分位简单等权；兼容旧两因子评分调用。"""
+    if factor_names is None:
+        w = system.get("weights") or {}
+        wb = float(w.get("bp", 0.6)) if w_bp is None else float(w_bp)
+        wr = 1.0 - wb
+        factor_names = ["bp", "momentum_20"]
+        directions = {"bp": 1.0, "momentum_20": -1.0}
+        weights = {"bp": wb, "momentum_20": wr}
+    else:
+        factor_names = list(factor_names)
+        if not factor_names:
+            raise ValueError("factor_names 不能为空")
+        directions = {name: 1.0 for name in factor_names}
+        weights = {name: 1.0 / len(factor_names) for name in factor_names}
 
-    只在"可选池 ∩ bp/mom 都有值"的样本上算分位 —— 分位的分母必须是**同一批票**，
-    否则 bp 分位和反转分位不在一个尺度上，加权没有意义。
-
-    005R 未改本函数（评分层冻结）。`idx` 是全局列号，后续所有数组都按它的顺序对齐。
-    """
-    w = system.get("weights") or {}
-    wb = float(w.get("bp", 0.6)) if w_bp is None else float(w_bp)
-    wr = 1.0 - wb
     mask = uni["mask"]
-    b = mats["bp"][i]
-    m = mats["momentum_20"][i]
-    ok = mask & np.isfinite(b) & np.isfinite(m)
+    values = {name: mats[name][i] for name in factor_names}
+    ok = mask.copy()
+    for name in factor_names:
+        ok &= np.isfinite(values[name])
     idx = np.nonzero(ok)[0]
-    out = {"weight_bp": wb, "weight_reversal": wr, "idx": idx,
-           "n_candidates": int(len(idx)), "bp_pct": None, "rev_pct": None,
-           "score": None, "mom_raw": None}
+    out = {"factor_names": factor_names, "factor_weights": weights, "idx": idx,
+           "n_candidates": int(len(idx)), "score": None, "factor_pct": None,
+           "mom_raw": mats.get("momentum_20", np.full(mask.shape, np.nan))[i][idx]}
+    if factor_names == ["bp", "momentum_20"]:
+        out.update({"weight_bp": weights["bp"], "weight_reversal": weights["momentum_20"],
+                    "bp_pct": None, "rev_pct": None})
     if len(idx) == 0:
         return out
-    sb = _pct_rank(b[idx])
-    sr = 1.0 - _pct_rank(m[idx])
-    out["bp_pct"] = sb
-    out["rev_pct"] = sr
-    out["score"] = wb * sb + wr * sr
-    out["mom_raw"] = m[idx]
+    pcts = {name: directions[name] * _pct_rank(values[name][idx])
+            if directions[name] > 0 else 1.0 - _pct_rank(values[name][idx])
+            for name in factor_names}
+    out["factor_pct"] = pcts
+    out["score"] = sum(weights[n] * pcts[n] for n in factor_names)
+    if factor_names == ["bp", "momentum_20"]:
+        out["bp_pct"], out["rev_pct"] = pcts["bp"], pcts["momentum_20"]
     return out
 
 
 # ---------------------------------------------------------------- 截面缓存（评分层唯一出口）
 def score_cross_sections(fd, system: dict, mats: dict[str, np.ndarray],
-                         amount: np.ndarray, w_bp: float | None = None) -> dict[int, dict]:
+                         amount: np.ndarray, w_bp: float | None = None,
+                         factor_names: list[str] | None = None) -> dict[int, dict]:
     """把**全部月末截面**的评分算一次缓存起来，供各档位复用。
 
     这么做有两个实在好处（不只是省时间）：
@@ -354,7 +366,8 @@ def score_cross_sections(fd, system: dict, mats: dict[str, np.ndarray],
     cache: dict[int, dict] = {}
     for i in month_end_indices(fd.dates):
         uni = build_universe(fd, i, system, mats, amount)
-        cs = composite_scores(fd, i, uni, system, mats, w_bp=w_bp)
+        cs = composite_scores(fd, i, uni, system, mats, w_bp=w_bp,
+                              factor_names=factor_names)
         cs = dict(cs)
         cs["i"] = i
         cs["date"] = fd.dates[i]
@@ -365,6 +378,172 @@ def score_cross_sections(fd, system: dict, mats: dict[str, np.ndarray],
                        if cs["n_candidates"] else np.array([], dtype="int64"))
         cache[i] = cs
     return cache
+
+
+def rolling_factor_mats(fd) -> dict[str, np.ndarray]:
+    """004C 滚动评分所需因子及旧否决项。"""
+    from src.factors import FACTOR_DEFS
+    mats = factor_mats(fd)
+    for name in ("lowvol_20", "lowvol_60", "lowvol_120", "turn_stab_60",
+                 "reversal_20", "reversal_40", "reversal_60"):
+        mats[name] = FACTOR_DEFS[name](fd)
+    return mats
+
+
+def rolling_factor_selection(report: dict, window: str) -> tuple[list[str], dict]:
+    """从 C1 已冻结的逐窗判定中读取入选集合，不重算研究结果。"""
+    selected = []
+    for name, verdict in report["c4_verdict"].items():
+        row = next((r for r in verdict["per_window"] if r["window"] == window), None)
+        if row and row.get("pass"):
+            selected.append(name)
+    reversal = report["reversal_primary"][window]
+    rev_name = f"reversal_{reversal['primary_window']}"
+    selected = [n for n in selected if not n.startswith("reversal_")]
+    if rev_name in report["c4_verdict"]:
+        row = next((r for r in report["c4_verdict"][rev_name]["per_window"]
+                    if r["window"] == window), None)
+        if row and row.get("pass"):
+            selected.append(rev_name)
+    return selected, reversal
+
+
+def rolling_validation(fd, system: dict, mats: dict[str, np.ndarray],
+                       amount: np.ndarray, *, verbose: bool = False) -> dict:
+    """24/12逐窗冻结因子与主窗，2021~2025完整年度滚动验证。"""
+    from src.research_004c import build_windows
+    val = system["validation"]
+    report_path = ROOT / val["factor_report"]
+    factor_report = json.loads(report_path.read_text(encoding="utf-8"))
+    windows = build_windows(fd.dates)
+    if len(windows) != 5 or any(w["i_test1"] - w["i_test0"] < 200 for w in windows):
+        raise RuntimeError("rolling_24_12 需要完整的 2021~2025 五个年度窗口")
+
+    rows, portfolios = [], []
+    w1_factors, _ = rolling_factor_selection(factor_report, windows[0]["name"])
+    if not w1_factors:
+        raise RuntimeError("W1 没有通过 C4 的因子，不能在 2020-12-31 前定档")
+    fit_cache = score_cross_sections(fd, system, mats, amount,
+                                     factor_names=w1_factors)
+    fit0, fit1, fit_meas = _seg_window(fd, fd.dates[0], "2020-12-31")
+    band_rows = scan_bands(fd, system, mats, amount, fit0, fit1, fit_meas,
+                           [float(x) for x in system["portfolio"]["band_candidates"]],
+                           factor_names=w1_factors)
+    pick = select_band(band_rows, 0.0)
+    band = pick["selected"]
+    for w in windows:
+        factor_names, reversal = rolling_factor_selection(factor_report, w["name"])
+        if not factor_names:
+            raise RuntimeError(f"{w['name']} 没有通过 C4 的因子，不构造空综合分")
+        cache = score_cross_sections(fd, system, mats, amount,
+                                     factor_names=factor_names)
+        sig = signals_from_cache(fd, cache, band)
+        i0, i1 = w["i_test0"], w["i_test1"]
+        # 用测试段前一个交易日作预热，指标从测试首日开始，保留冻结前的最后一期持仓。
+        warm0 = max(0, i0 - 1)
+        seg = run_segment(fd, cache, warm0, i1, sig, system, i_meas=i0)
+        strategy = seg.get("strategy") or {}
+        bench = seg.get("bench") or {}
+        benchmark_raw = pd.read_parquet(ROOT / "data/raw/index/hs300_total_return_2026-11-09.parquet")
+        benchmark_raw = benchmark_raw.set_index("date")["close"].reindex(fd.dates[i0:i1])
+        if benchmark_raw.isna().any():
+            raise RuntimeError(f"{w['name']} H00300 缺少检验交易日")
+        benchmark_nav = benchmark_raw / float(benchmark_raw.iloc[0])
+        test_nav = pd.Series((seg.get("_strategy_nav") or {}), dtype="float64").reindex(fd.dates[i0:i1])
+        if test_nav.isna().any():
+            raise RuntimeError(f"{w['name']} 策略净值缺少检验交易日")
+        row_excess = _r(M.ann_return(test_nav) - M.ann_return(benchmark_nav))
+        row_benchmark_mdd = _r(M.max_drawdown(benchmark_nav)["mdd"])
+        seg["_benchmark_nav"] = {str(d): float(v) for d, v in zip(benchmark_nav.index,
+                                                                     benchmark_nav.to_numpy())}
+        row = {"window": w["name"], "period": str(w["test_year"]),
+               "train_start": w["train_start"], "train_end": w["train_end"],
+               "test_start": w["test_start"], "test_end": w["test_end"],
+               "selected_factors": factor_names,
+               "factor_weights": {n: 1.0 / len(factor_names) for n in factor_names},
+               "reversal_primary": reversal, "band": band,
+               "band_selection_forced": pick["forced"], "forced": pick["forced"],
+               "excess": row_excess, "strategy_ann": _r(M.ann_return(test_nav)),
+               "benchmark_ann": _r(M.ann_return(benchmark_nav)),
+               "strategy_mdd": _r(M.max_drawdown(test_nav)["mdd"]),
+               "benchmark_mdd": row_benchmark_mdd,
+               "n_days": seg.get("n_days"), "n_rebalance": seg.get("n_rebalance"),
+               "k_median": seg.get("k_median"), "avg_cash_ratio": strategy.get("avg_cash_ratio")}
+        rows.append(row)
+        portfolios.append({"window": w, "system": system, "cache": cache,
+                           "signals": sig, "segment": seg, "row": row})
+        if verbose:
+            print(f"[004C] {w['name']} {factor_names} band={band:.0%} excess={seg.get('excess')}",
+                  flush=True)
+
+    excesses = [r["excess"] for r in rows if r["excess"] is not None]
+    mean_excess = float(np.mean(excesses)) if excesses else None
+    positive = sum(x > 0 for x in excesses)
+    strategy_nav, benchmark_nav = {}, {}
+    strategy_level = benchmark_level = 1.0
+    for item in portfolios:
+        seg = item["segment"]
+        strat_part = pd.Series(seg.get("_strategy_nav") or {}, dtype="float64")
+        bench_part = pd.Series(seg.get("_benchmark_nav") or {}, dtype="float64")
+        if strat_part.empty or bench_part.empty:
+            raise RuntimeError("滚动窗口缺少策略或 H00300 净值")
+        strat_part = strat_part / float(strat_part.iloc[0]) * strategy_level
+        bench_part = bench_part / float(bench_part.iloc[0]) * benchmark_level
+        strategy_level = float(strat_part.iloc[-1])
+        benchmark_level = float(bench_part.iloc[-1])
+        strategy_nav.update(strat_part.to_dict())
+        benchmark_nav.update(bench_part.to_dict())
+    expected_days = sum(item["window"]["i_test1"] - item["window"]["i_test0"]
+                        for item in portfolios)
+    if len(strategy_nav) != expected_days:
+        raise RuntimeError("滚动窗口策略净值缺失或日期重叠，不能计算全段回撤")
+    strat_series = pd.Series(strategy_nav).sort_index()
+    benchmark_series = pd.Series(benchmark_nav).reindex(strat_series.index)
+    if benchmark_series.isna().any():
+        raise RuntimeError("H00300 基准净值缺少滚动检验交易日")
+    mdd = _nav_metrics(strat_series)["mdd"]
+    rolling = {"method": "rolling_24_12", "benchmark": "H00300",
+               "benchmark_path": "data/raw/index/hs300_total_return_2026-11-09.parquet",
+               "band_selection": {"fit_end": "2020-12-31", "factors": w1_factors,
+                                   "selected": band, "forced": pick["forced"],
+                                   "table": band_rows},
+               "band_selection_forced": pick["forced"],
+               "windows": rows, "mean_excess": _r(mean_excess),
+               "positive_windows": positive, "window_count": len(rows),
+               "portfolio_mdd": mdd, "portfolio_mdd_peak": M.max_drawdown(strat_series)["peak"],
+               "portfolio_mdd_trough": M.max_drawdown(strat_series)["trough"],
+               "_portfolios": portfolios}
+    return rolling
+
+
+def analyze_004c(fd, cfg: dict, *, verbose: bool = False) -> dict:
+    """004C 执行链：C1冻结因子 → C2滚动回测 → C5准入闸。"""
+    system = C.system_params(cfg)
+    mats = rolling_factor_mats(fd)
+    amount = trade_amount(fd)
+    rolling = rolling_validation(fd, system, mats, amount, verbose=verbose)
+    forced = bool(rolling.get("band_selection_forced"))
+    gates = evaluate_gates({}, {}, None, system, forced=forced, rolling=rolling)
+    verdict = "advise" if gates["both_pass"] else "fallback"
+    reason = gates["fallback_reason"]
+    report = {
+        "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "schema_version": "004C-1", **_git_meta(), "verdict": verdict,
+        "fallback_reason": reason,
+        "validation": {k: v for k, v in rolling.items() if not k.startswith("_")},
+        "gates": gates,
+        "fallback": (None if verdict == "advise" else {
+            "message": "不可作投资建议引用", "fallback_reason": reason,
+            "reasons": [f"004C 策略准入闸未通过：{reason}"],
+            "research_conclusion": "因子研究与滚动窗口结果保留，不因 fallback 丢弃。"}),
+        "card": None,
+        "validity_note": [
+            "验证基准为沪深300全收益指数 H00300。",
+            "窗口级回撤仅记录；策略准入回撤为五个滚动检验年度串接后的组合最大回撤。",
+            "全段最大回撤由最深年份主导，不是五年逐年回撤考核。",
+            "窗口因子与反转主窗均由对应训练段冻结，检验段只评估。"],
+    }
+    return report
 
 
 def select_top_k(cs: dict, band: float) -> tuple[int, np.ndarray]:
@@ -716,6 +895,7 @@ def run_segment(fd, cache: dict[int, dict], i0: int, i1: int, sig_all: dict,
         m["positions_mean"] = _r(float(navd["positions"].mean()), 1)
     m["available"] = True
     out["strategy"] = m
+    out["_strategy_nav"] = {str(d): float(v) for d, v in zip(nav.index, nav.to_numpy())}
     out["excess"] = _r(m["ann_return"] - out["bench"]["ann_return"])
     out["excess_market"] = _r(m["ann_return"] - out["bench_market"]["ann_return"])
     return out
@@ -723,12 +903,13 @@ def run_segment(fd, cache: dict[int, dict], i0: int, i1: int, sig_all: dict,
 
 # ---------------------------------------------------------------- 选档与验证
 def scan_bands(fd, system: dict, mats: dict[str, np.ndarray], amount: np.ndarray,
-               i0: int, i1: int, i_meas: int, bands: list[float]) -> list[dict]:
+               i0: int, i1: int, i_meas: int, bands: list[float],
+               factor_names: list[str] | None = None) -> list[dict]:
     """在**一段**区间上把各候选档位都跑一遍（选档只许调这个函数，传入的只能是定档段）。
 
     返回每档一行：只数、年化、回撤、对池基准超额、现金拖累。
     """
-    cache = score_cross_sections(fd, system, mats, amount)
+    cache = score_cross_sections(fd, system, mats, amount, factor_names=factor_names)
     rows = []
     for b in bands:
         sig = signals_from_cache(fd, cache, b)
@@ -906,78 +1087,83 @@ def _ic_stats(ics: list[float]) -> dict:
             "note": "月频 IC 存在自相关，t 值高估显著性，只作量级参考，不作 alpha 证据"}
 
 
-def evaluate_gates(dev: dict, yearly: dict, holdout: dict, system: dict) -> dict:
-    """硬门槛（005R 更新版，业主裁定）：
-
-    ① dev 超额（对**可投池等权**）> dev_min_excess（默认 0）
-    ② 分年各期 + holdout 均不得出现「回撤深于基准 period_max_dd_worse（默认 10pp）」
-    ③ 方向检查**只在 dev 通过之后**才做（dev 不过直接 fallback，不比方向）
-
-    方向的定义沿用 005：超额符号一致。dev 通过意味着 dev 超额 > 0，于是这条
-    实际要求 holdout 也为正 —— 卡上会把这个含义写清楚，不靠读者自己推。
-    """
+def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
+                   system: dict, *, forced: bool = False,
+                   rolling: dict | None = None) -> dict:
+    """004C准入闸：forced、组合绝对回撤、滚动稳定性，统一 fallback。"""
     g = system.get("gate") or {}
-    thr = float(g.get("dev_min_excess", 0.0))
-    dd_lim = float(g.get("period_max_dd_worse", 0.10))
-    dev_ex = dev.get("excess")
-    dev_pass = dev_ex is not None and float(dev_ex) > thr
-
-    def _dd_ok(seg: dict) -> tuple[bool | None, float | None]:
-        s = seg.get("strategy") or {}
-        b = seg.get("bench") or {}
-        sm, bm = s.get("mdd"), b.get("mdd")
-        if sm is None or bm is None:
-            return None, None
-        worse = abs(float(sm)) - abs(float(bm))
-        return bool(worse <= dd_lim + 1e-12), _r(worse)
-
-    periods = []
-    for r in yearly.get("rows") or []:
-        periods.append({"period": r["period"], "dd_ok": r.get("dd_ok"),
-                        "dd_worse_pp": r.get("dd_worse_pp"),
+    if rolling is None and (system.get("validation") or {}).get("method") == "yearly_freeze":
+        dev_ex = dev.get("excess")
+        thr = float(g.get("dev_min_excess", 0.0))
+        dev_pass = dev_ex is not None and float(dev_ex) > thr
+        rows = list(yearly.get("rows") or [])
+        dd_limit = float(g.get("period_max_dd_worse", 0.10))
+        period_rows = [{"period": r["period"], "dd_ok": r.get("dd_ok"),
+                        "dd_worse_pp": r.get("dd_worse_pp"), "excess": r.get("excess"),
                         "strategy_mdd": r.get("strategy_mdd"),
-                        "pool_mdd": r.get("pool_mdd"),
-                        "excess": r.get("excess")})
-    ho_dd_ok, ho_worse = _dd_ok(holdout)
-    periods.append({"period": "holdout", "dd_ok": ho_dd_ok, "dd_worse_pp": ho_worse,
-                    "strategy_mdd": (holdout.get("strategy") or {}).get("mdd"),
-                    "pool_mdd": (holdout.get("bench") or {}).get("mdd"),
-                    "excess": holdout.get("excess")})
+                        "pool_mdd": r.get("pool_mdd")}
+                       for r in rows]
+        dd_fail = [r["period"] for r in period_rows if r["dd_ok"] is False]
+        dd_pass = bool(period_rows) and not dd_fail
+        ho_ex = holdout.get("excess") if holdout else None
+        direction = None if not dev_pass or ho_ex is None else (
+            float(dev_ex) == 0 or float(ho_ex) == 0 or
+            ((float(dev_ex) > 0) == (float(ho_ex) > 0)))
+        return {"dev": {"pass": bool(dev_pass), "excess": dev_ex, "threshold": thr,
+                        "strategy_ann": (dev.get("strategy") or {}).get("ann_return"),
+                        "bench_ann": (dev.get("bench") or {}).get("ann_return")},
+                "periods": {"pass": dd_pass, "failed_periods": dd_fail,
+                            "rows": period_rows, "max_dd_worse": dd_limit},
+                "holdout": {"excess": ho_ex, "direction_consistent": direction,
+                            "strategy_ann": (holdout.get("strategy") or {}).get("ann_return") if holdout else None,
+                            "bench_ann": (holdout.get("bench") or {}).get("ann_return") if holdout else None,
+                            "strategy_mdd": (holdout.get("strategy") or {}).get("mdd") if holdout else None,
+                            "bench_mdd": (holdout.get("bench") or {}).get("mdd") if holdout else None,
+                            "checked": bool(dev_pass)}, 
+                "both_pass": bool(dev_pass and dd_pass and direction is not False)}
+    if rolling is None:
+        # 005R历史产物回归只允许拒绝，不把旧口径误读成004C证据。
+        return {"forced": {"pass": not forced, "reason": "forced" if forced else None},
+                "drawdown": {"pass": False, "mdd": None, "threshold": float(g.get("max_portfolio_mdd", 0.15)),
+                             "reason": "missing_rolling_evidence"},
+                "stability": {"pass": False, "mean_excess": None,
+                              "positive_windows": 0, "window_count": 0,
+                              "reason": "missing_rolling_evidence"},
+                "fallback_reason": "forced" if forced else "stability",
+                "both_pass": False}
 
-    dd_fail = [p["period"] for p in periods if p["dd_ok"] is False]
-    dd_all_ok = all(p["dd_ok"] is not False for p in periods) and any(
-        p["dd_ok"] is not None for p in periods)
-
-    ho_ex = holdout.get("excess")
-    dir_ok = None
-    if dev_pass and g.get("holdout_check_direction", True) and dev_ex is not None and ho_ex is not None:
-        dir_ok = (float(dev_ex) == 0.0 or float(ho_ex) == 0.0
-                  or (float(dev_ex) > 0) == (float(ho_ex) > 0))
-    direction_note = None
-    if dir_ok is False:
-        direction_note = ("dev 跑赢、holdout 跑输：典型的过拟合信号，最近一年不成立。")
-
-    return {
-        "dev": {"pass": bool(dev_pass), "excess": dev_ex,
-                "strategy_ann": (dev.get("strategy") or {}).get("ann_return"),
-                "bench_ann": (dev.get("bench") or {}).get("ann_return"),
-                "threshold": thr,
-                "rule": "组合年化 − 可投池等权年化 > 门槛（默认 > 0）"},
-        "periods": {"pass": bool(dd_all_ok), "max_dd_worse": dd_lim,
-                    "failed_periods": dd_fail, "rows": periods,
-                    "rule": f"各期回撤不得深于池基准 {dd_lim:.0%}"},
-        "holdout": {"excess": ho_ex,
-                    "strategy_ann": (holdout.get("strategy") or {}).get("ann_return"),
-                    "bench_ann": (holdout.get("bench") or {}).get("ann_return"),
-                    "strategy_mdd": (holdout.get("strategy") or {}).get("mdd"),
-                    "bench_mdd": (holdout.get("bench") or {}).get("mdd"),
-                    "dd_not_worse": ho_dd_ok,
-                    "direction_consistent": dir_ok,
-                    "direction_note": direction_note,
-                    "checked": bool(dev_pass),
-                    "rule": "仅 dev 通过后才查方向；dev 不过即 fallback，不比方向"},
-        "both_pass": bool(dev_pass and dd_all_ok and dir_ok is not False),
-    }
+    rows = rolling.get("windows") or []
+    mean_excess = rolling.get("mean_excess")
+    positive = int(rolling.get("positive_windows", 0))
+    count = int(rolling.get("window_count", len(rows)))
+    mdd = rolling.get("portfolio_mdd")
+    dd_limit = float(g["max_portfolio_mdd"])
+    mean_limit = float(g["min_avg_excess"])
+    positive_limit = int(g["min_positive_windows"])
+    forced_pass = not forced
+    drawdown_pass = mdd is not None and abs(float(mdd)) <= dd_limit + 1e-12
+    stability_pass = (mean_excess is not None and float(mean_excess) >= mean_limit
+                      and count == 5 and positive >= positive_limit)
+    reason = ("forced" if not forced_pass else
+              "drawdown" if not drawdown_pass else
+              "stability" if not stability_pass else None)
+    rolling["fallback_reason"] = reason
+    return {"forced": {"pass": forced_pass, "reason": "forced" if forced else None},
+            "drawdown": {"pass": bool(drawdown_pass), "mdd": mdd,
+                          "threshold": dd_limit, "scope": "rolling_full_period"},
+            "stability": {"pass": bool(stability_pass), "mean_excess": mean_excess,
+            "mean_threshold": mean_limit, "positive_windows": positive,
+            "positive_threshold": positive_limit, "window_count": count,
+            "rule": "平均超额≥2pp 且 5 窗口中至少4个为正"},
+            "dev": {"strategy_ann": None, "bench_ann": None, "excess": None,
+                    "pass": False, "threshold": 0.0},
+            "periods": {"pass": False, "rows": [], "failed_periods": [],
+                        "max_dd_worse": None},
+            "holdout": {"strategy_ann": None, "bench_ann": None, "excess": None,
+                        "strategy_mdd": None, "bench_mdd": None,
+                        "direction_consistent": None, "checked": False},
+            "fallback_reason": reason,
+            "both_pass": bool(forced_pass and drawdown_pass and stability_pass)}
 
 
 # ---------------------------------------------------------------- 建议卡
@@ -1246,6 +1432,8 @@ def analyze(fd, cfg: dict, *, verbose: bool = False) -> dict:
     band 一旦冻结，后面任何一步的结果都不许回头改它。
     """
     system = C.system_params(cfg)
+    if system["validation"].get("method") == "rolling_24_12":
+        return analyze_004c(fd, cfg, verbose=verbose)
     owner = C.owner_profile(cfg)
     port = system.get("portfolio") or {}
     val = system.get("validation") or {}
@@ -1370,6 +1558,9 @@ def analyze(fd, cfg: dict, *, verbose: bool = False) -> dict:
                            f"方向相反（{gates['holdout']['direction_note']}）")
         fallback = {
             "message": "本次不建议",
+            "fallback_reason": ("forced" if pick["forced"] else
+                               "drawdown" if not gates["periods"]["pass"] else
+                               "stability"),
             "band": band,
             "reasons": reasons,
             "numbers": {

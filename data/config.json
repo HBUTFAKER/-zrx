@@ -66,26 +66,29 @@
       "expected_positions_comment": "预期持仓只数区间，只用于卡上提示，不构成门槛（不调档迁就）。"
     },
     "gate": {
-      "_comment": "硬门槛（005R 更新版）：全部通过才出建议卡，任一不过输出 fallback。",
+      "_comment": "硬门槛（004C）：forced / 全段组合绝对回撤 / 五年滚动稳定性，任一不过输出 fallback。",
       "dev_min_excess": 0.0,
-      "dev_comment": "dev 段超额（对可投池等权）必须 > 本值。",
-      "period_max_dd_worse": 0.1,
-      "period_comment": "分年各期与 holdout 的回撤，不得比可投池等权深超过本值（10pp）。",
-      "holdout_check_direction": true,
-      "direction_comment": "方向检查**只在 dev 通过之后**才做；dev 不过即 fallback，不比方向。"
+      "dev_comment": "仅旧流程粗筛兼容项；004C终验统一对H00300。",
+      "max_portfolio_mdd": 0.15,
+      "min_avg_excess": 0.02,
+      "min_positive_windows": 4
     },
     "validation": {
-      "_comment": "band 的定档段与准样本外分年（业主给的两选一，本单选分年冻结-后验：band 是单个离散参数，按月重选主要增加噪声；分年 4 段已能回答'是不是只有某一年行'）。",
-      "method": "yearly_freeze",
-      "band_fit_end": "2021-12-31",
-      "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2021-12-31 共 48 个截面。",
+      "_comment": "24个月训练 / 12个月检验；因子与反转主窗逐窗口冻结。",
+      "method": "rolling_24_12",
+      "band_fit_end": "2020-12-31",
+      "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2020-12-31 共 36 个截面。",
       "years": [
+        "2021",
         "2022",
         "2023",
         "2024",
         "2025"
       ],
-      "years_comment": "准样本外年份，逐年独立跑。2025 段自动截到 holdout.start 前一日（11 个月的短年，横向比较需注意）。"
+      "years_comment": "滚动检验段为2021~2025，每段完整12个月；2025为完整年度。",
+      "train_months": 24,
+      "test_months": 12,
+      "factor_report": "out/004c_c1_factors.json"
     },
     "holdout": {
       "_comment": "holdout 段边界，冻结不许改（factors.DEV_END / HOLDOUT_START 同源）。",

@@ -109,6 +109,8 @@ def make_fd(*, trap_up: bool, months: int = 27, n_codes: int = N_TOTAL,
 def cfg() -> dict:
     """合成数据只覆盖 2024-01 起，所以定档/验证年份要按数据改，不能沿用真实配置。"""
     c = C.default_config()
+    c["system"]["validation"]["method"] = "yearly_freeze"
+    c["system"]["validation"]["years"] = ["2022", "2023", "2024", "2025"]
     c["system"]["validation"]["band_fit_end"] = "2025-06-30"
     c["system"]["validation"]["years"] = ["2024", "2025"]
     return c
@@ -407,12 +409,14 @@ def test_yearly_skips_years_outside_data(cfg):
 # ================================================================ 6. 门槛
 def test_gates_dev_fail_means_no_direction_check():
     """dev 不过 → 直接 fallback，**不看 holdout 方向**（005R 裁定②）。"""
+    old_cfg = C.default_config()
+    old_cfg["system"]["validation"]["method"] = "yearly_freeze"
     dev = {"excess": -0.10, "strategy": {"ann_return": -0.05}, "bench": {"ann_return": 0.05}}
     holdout = {"excess": 0.20, "strategy": {"ann_return": 0.30, "mdd": -0.10},
                "bench": {"ann_return": 0.10, "mdd": -0.20}}
     yearly = {"rows": [{"period": "2022", "dd_ok": True, "dd_worse_pp": 0.01,
                         "strategy_mdd": -0.20, "pool_mdd": -0.21, "excess": -0.02}]}
-    g = evaluate_gates(dev, yearly, holdout, _sys(C.default_config()))
+    g = evaluate_gates(dev, yearly, holdout, _sys(old_cfg))
     assert g["dev"]["pass"] is False
     assert g["holdout"]["direction_consistent"] is None, "dev 不过就不比方向"
     assert g["holdout"]["checked"] is False
@@ -421,8 +425,10 @@ def test_gates_dev_fail_means_no_direction_check():
 
 def test_gates_period_drawdown_rule():
     """各期回撤：比池深 10pp 以内算过，超过就整条门槛不过（逐年逐期判）。"""
+    old_cfg = C.default_config()
+    old_cfg["system"]["validation"]["method"] = "yearly_freeze"
     dev = {"excess": 0.05, "strategy": {"ann_return": 0.12}, "bench": {"ann_return": 0.07}}
-    sysd = _sys(C.default_config())
+    sysd = _sys(old_cfg)
     holdout = {"excess": 0.03, "strategy": {"ann_return": 0.10, "mdd": -0.18},
                "bench": {"ann_return": 0.07, "mdd": -0.20}}
     ok = evaluate_gates(dev, {"rows": [
@@ -444,6 +450,62 @@ def test_gates_period_drawdown_rule():
          "bench": {"ann_return": 0.04, "mdd": -0.20}}, sysd)
     assert flipped["holdout"]["direction_consistent"] is False
     assert flipped["both_pass"] is False
+
+
+def test_004c_rejects_005r_legacy_evidence():
+    """005R旧产物没有rolling证据，必须被新闸拦下并给出可追溯原因。"""
+    import json
+    from pathlib import Path
+    old_path = Path(__file__).resolve().parents[1] / "out" / "advice_card.json"
+    if not old_path.exists():
+        pytest.skip("仓库中没有005R旧建议卡产物")
+    old = json.loads(old_path.read_text(encoding="utf-8"))
+    sysd = _sys(C.default_config())
+    result = evaluate_gates(old.get("segments", {}).get("dev", {}),
+                            old.get("validation", {}),
+                            old.get("segments", {}).get("holdout", {}), sysd)
+    assert result["both_pass"] is False
+    assert result["fallback_reason"] in {"forced", "stability"}
+    assert result["drawdown"]["reason"] == "missing_rolling_evidence"
+
+
+def test_004c_gates_require_forced_drawdown_and_stability():
+    """004C三道门均用已知输入事前验证，任一失败就fallback。"""
+    sysd = _sys(C.default_config())
+    good = {"windows": [{"excess": 0.03}] * 5,
+            "mean_excess": 0.02, "positive_windows": 4, "window_count": 5,
+            "portfolio_mdd": -0.15}
+    passed = evaluate_gates({}, {}, None, sysd, rolling=good)
+    assert passed["both_pass"] is True
+    assert passed["fallback_reason"] is None
+
+    for field, value, reason in (("portfolio_mdd", -0.150001, "drawdown"),
+                                 ("mean_excess", 0.019999, "stability"),
+                                 ("positive_windows", 3, "stability")):
+        bad = dict(good, **{field: value})
+        result = evaluate_gates({}, {}, None, sysd, rolling=bad)
+        assert result["both_pass"] is False
+        assert result["fallback_reason"] == reason
+
+    forced = evaluate_gates({}, {}, None, sysd, forced=True, rolling=good)
+    assert forced["both_pass"] is False
+    assert forced["fallback_reason"] == "forced"
+
+
+def test_004c_composite_is_simple_equal_weight_of_selected_factors(cfg):
+    """入选因子分位严格按1/N等权，低波因子与反转均参与。"""
+    fd = make_fd(trap_up=True, months=13)
+    mats, amt = _mats(fd)
+    from src.factors import FACTOR_DEFS
+    for name in ("lowvol_20", "reversal_20"):
+        mats[name] = FACTOR_DEFS[name](fd)
+    i = 23
+    uni = build_universe(fd, i, _sys(cfg), mats, amt)
+    cs = composite_scores(fd, i, uni, _sys(cfg), mats,
+                          factor_names=["lowvol_20", "reversal_20"])
+    expected = (cs["factor_pct"]["lowvol_20"] + cs["factor_pct"]["reversal_20"]) / 2
+    assert np.allclose(cs["score"], expected)
+    assert cs["factor_weights"] == {"lowvol_20": 0.5, "reversal_20": 0.5}
 
 
 # ================================================================ 7. 端到端
@@ -468,11 +530,13 @@ def test_analyze_advises_when_gates_pass(cfg):
 def test_analyze_outputs_fallback_without_card(cfg):
     """dev 跑不赢可投池 → verdict=fallback、card 为 null、preview 标注不构成建议。"""
     fd = make_fd(trap_up=False)
+    cfg["system"]["validation"]["method"] = "yearly_freeze"
     rep = analyze(fd, cfg)
     assert rep["verdict"] == "fallback"
     assert rep["card"] is None
     fb = rep["fallback"]
     assert fb["message"] == "本次不建议" and fb["reasons"]
+    assert "fallback_reason" in fb
     assert fb["numbers"]["dev"]["strategy_ann"] is not None
     assert fb["numbers"]["holdout"]["bench_ann"] is not None
     assert fb["numbers"]["yearly"], "fallback 也要带分年数字"
@@ -684,6 +748,9 @@ def test_config_defaults_and_merge(tmp_path):
                              "system": {"portfolio": {"band": 0.08}}}),
                  encoding="utf-8")
     cfg = C.load_config(p)
+    assert cfg["system"]["validation"]["method"] == "rolling_24_12"
+    assert cfg["system"]["validation"]["years"] == ["2021", "2022", "2023", "2024", "2025"]
+    assert cfg["system"]["gate"]["max_portfolio_mdd"] == 0.15
     assert cfg["owner"]["budget"] == 50000
     assert cfg["owner"]["experience"] == C.DEFAULT_OWNER["experience"], "未写的字段用默认"
     assert C.owner_profile(cfg)["max_drawdown"] == -0.10
@@ -701,8 +768,10 @@ def test_config_defaults_and_merge(tmp_path):
     ({"system": {"portfolio": {"band_candidates": [0.1, 0.2]}}}, "至少 4 档"),
     ({"system": {"portfolio": {"band_candidates": [0.2, 0.1, 0.3, 0.4]}}}, "升序"),
     ({"system": {"validation": {"years": ["22"]}}}, "四位年份"),
-    ({"system": {"validation": {"method": "rolling"}}}, "yearly_freeze"),
+    ({"system": {"validation": {"method": "rolling"}}}, "rolling_24_12"),
     ({"system": {"gate": {"period_max_dd_worse": -0.1}}}, "period_max_dd_worse"),
+    ({"system": {"validation": {"method": "rolling_24_12"},
+                   "gate": {"period_max_dd_worse": 0.1}}}, "period_max_dd_worse"),
 ])
 def test_config_rejects_bad_values(tmp_path, bad, msg):
     """越界配置一律抛错，不做容错兜底。"""

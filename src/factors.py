@@ -882,6 +882,48 @@ def size(close_raw: np.ndarray, volume: np.ndarray, turn: np.ndarray) -> np.ndar
     return out
 
 
+def _rolling_std(mat: np.ndarray, window: int) -> np.ndarray:
+    """按列滚动样本标准差（ddof=1）：**窗口内必须满 window 个有效值**，否则 NaN。
+
+    min_periods=window 是"不插补"的物理实现：窗口里少一天（停牌、hfq 缺口、
+    上市不足）就返回 NaN，让下游按"排除"处理，而不是拿不足的样本算一个
+    看似正常的标准差。004C 明令：换手率窗口不足 60 日排除、不插补。
+    """
+    if mat.shape[0] < window:
+        return np.full(mat.shape, np.nan, dtype="float64")
+    df = pd.DataFrame(mat)
+    out = df.rolling(window=int(window), min_periods=int(window)).std(ddof=1)
+    return out.to_numpy(dtype="float64")
+
+
+def realized_vol(px: np.ndarray, window: int) -> np.ndarray:
+    """已实现波动：过去 window 个交易日**日收益**的标准差（px 必须是 hfq 价）。
+
+    T 日值只用 ≤T-1 的数据（先滚动、再 _shift1），与全模块口径一致。
+    窗口内任一天缺价 → 该日收益 NaN → 整窗 NaN，不插补。
+    用 hfq 而不是原始价：除权日的假跌幅会被记进波动，低波因子会挑出
+    正在分红的股票，那是噪声不是低风险。
+    """
+    r = np.full(px.shape, np.nan, dtype="float64")
+    if px.shape[0] > 1:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            r[1:] = px[1:] / px[:-1] - 1.0
+    r[~np.isfinite(r)] = np.nan
+    return _shift1(_rolling_std(r, window))
+
+
+def turn_stability(turn: np.ndarray, window: int = 60) -> np.ndarray:
+    """换手率稳定性：过去 window 日**换手率的**标准差，低者优（值越小越稳）。
+
+    turn ≤ 0（停牌/无成交）不是"换手率为零"，是"没有交易"，先置 NaN 再滚动；
+    否则停牌日会被当成极端低换手，把"停牌多"误判成"很稳定"。
+    返回原始值（越小越好），定向取负号由 FACTOR_DEFS 里的 `turn_stab_60` 负责。
+    """
+    t = _shift1(turn)
+    t = np.where(np.isfinite(t) & (t > 0.0), t, np.nan)
+    return _rolling_std(t, window)
+
+
 def _need(fd: FactorData, attr: str, factor: str) -> np.ndarray:
     """取因子依赖的附加数据；没载入就报错，不许悄悄返回空矩阵。"""
     v = getattr(fd, attr, None)
@@ -911,11 +953,28 @@ FACTOR_DEFS = {
     "roe_ttm": lambda fd: _quality(_need(fd, "roe_ttm", "roe_ttm")),
     "yoy_ni": lambda fd: _quality(_need(fd, "yoy_ni", "yoy_ni")),
     "debt_ratio": lambda fd: _quality(_need(fd, "debt_ratio", "debt_ratio")),
+    # —— 004C 新增：低波动异象。**方向已在本层取负号**（值越大 = 波动越低 = 越优），
+    # 这样下游算 IC 时"正相关"就等于"方向为正"，不必再在报告里二次解释符号
+    # （004C 复核 ①：先定向再判方向，避免低波动因子被自己的规则误杀）。
+    "lowvol_20": lambda fd: -realized_vol(fd.panel.close_hfq, 20),
+    "lowvol_60": lambda fd: -realized_vol(fd.panel.close_hfq, 60),
+    "lowvol_120": lambda fd: -realized_vol(fd.panel.close_hfq, 120),
+    "turn_stab_60": lambda fd: -turn_stability(fd.turn, 60),
+    # —— 004C C2：反转多窗口。动量取负号 = 反转，值越大 = 过去跌得越多 = 越优。
+    # 现有 005R 的综合分用的是 `1 - momentum_20 分位`，与 reversal_20 同义。
+    "reversal_20": lambda fd: -momentum(fd.panel.close_hfq, 20),
+    "reversal_40": lambda fd: -momentum(fd.panel.close_hfq, 40),
+    "reversal_60": lambda fd: -momentum(fd.panel.close_hfq, 60),
 }
 
 #: 004B 报告默认因子集（既有 5 个 + 质量 3 个 + 真实股本 size）
 DEFAULT_FACTORS = ("momentum_20", "momentum_60", "ep", "bp", "size",
                    "size_real", "roe_ttm", "yoy_ni", "debt_ratio")
+
+#: 004C 候选因子（C1 低波动 4 个 + C2 反转 3 个）。全部已定向：值越大越优，
+#: 于是"IC 正 + |t| ≥ 2"即等于 004C 说的"方向为正且够强"。
+FACTORS_004C = ("lowvol_20", "lowvol_60", "lowvol_120", "turn_stab_60",
+                "reversal_20", "reversal_40", "reversal_60")
 
 
 def compute_factors(fd: FactorData, names: list[str] | None = None) -> dict[str, np.ndarray]:
