@@ -8,11 +8,16 @@
   · `disclaimer` 与 `multi_user` 只留位不实现（业主拍板：将来决定卖了再做）。
     留 None 而不是编造默认文案，避免"没实现的东西看起来像实现了"。
 
-为什么位置上限要用回撤参数算（`position_cap`）：
-  单票上限不是拍脑袋的 20%，而是从业主能忍的回撤反推 —— 假设单票极端跌幅 50%
-  （连续跌停 / 退市整理），那么"单票全损正好用满回撤预算"对应的上限就是
-  2 × |最大回撤|。容忍 15% → 单票上限 30%；容忍 10% → 20%。这样卡上的仓位数字
-  和业主自己的问卷答案是同一件事，能当场解释，不用事后找理由。
+005R 变更（分位带分散组合）：
+  · `system.n_hold` / `system.max_weight` **删除**。持仓只数不再写死，改由
+    `system.portfolio.band`（前 N% 等权）逐截面算出 k，单票权重恒为 1/k。
+    老配置里还留着这两个键会直接报错 —— 静默忽略等于让人以为"按 5 只跑"，
+    实际按 100 只跑，这类"看着像生效"的配置比报错危险得多。
+  · 新增 `system.validation`：band 的定档段与分年验证年份。
+  · `system.backtest.init_cash` 从 100 万提到 5000 万：等权 100+ 只时，
+    一手（100 股）取整会吃掉 10% 以上的仓位；现金拖累会**系统性惩罚大 k 的档位**，
+    让选档结论失真。这个数只影响回测模拟精度，与业主真实预算无关
+    （真实预算的可行性另由卡上的 `budget` 段算）。
 """
 from __future__ import annotations
 
@@ -23,11 +28,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PATH = ROOT / "data" / "config.json"
 
-#: 单票极端跌幅假设（连续跌停 / 退市整理 / 黑天鹅）。A 股个股腰斩是常态量级，
-#: 取 50% 是保守值；若取 30% 会让上限虚高（3.3×回撤容忍），失去约束意义。
-SINGLE_NAME_CRASH = 0.50
-
 TARGET_TYPES = ("beat_benchmark", "annual_return")
+
+#: 005R 起由 portfolio.band 决定持仓只数，这两个键属于旧口径
+LEGACY_SYSTEM_KEYS = ("n_hold", "max_weight")
 
 #: 系统参数默认值。权重默认 bp 0.6 / 反转 0.4（业主拍板·方案 B）。
 #: 阈值全部来自 dev 段实测分布，依据写在 `_comment` 里，改阈值请连注释一起改。
@@ -36,7 +40,8 @@ DEFAULT_SYSTEM: dict = {
     "weights": {
         "_comment": "综合得分 = bp 分位 × w_bp + 反转分位 × w_rev；两项必须和为 1。"
                     "实测 dev 段 IC：0.5→+0.0752 / 0.6→+0.0707 / 0.7→+0.0645，"
-                    "反转权重越高组合 IC 越高（见产物 weight_sensitivity）。",
+                    "反转权重越高组合 IC 越高（见产物 weight_sensitivity）。"
+                    "005R 未改这一层 —— 综合分排序能力为正（t≈4），问题出在持仓形态。",
         "bp": 0.60,
         "reversal": 0.40,
     },
@@ -61,16 +66,40 @@ DEFAULT_SYSTEM: dict = {
         "exclude_limit_up": True,
         "exclude_limit_up_comment": "截面日或次日开盘涨停的票不可选（次日买不进）。",
     },
-    "n_hold": 5,
-    "max_weight": 0.30,
-    "max_weight_comment": "单票权重上限。默认 30% = 2 × |owner.max_drawdown|，"
-                          "含义是「单票全损（-50%）正好用满业主的回撤预算」。"
-                          "改 owner.max_drawdown 时请同步改这里。",
+    "portfolio": {
+        "_comment": "持仓形态：综合分前 band 比例的全部股票等权持有（005R 业主拍板）。"
+                    "band 由 validation.band_fit_end 之前的定档段扫描确定，"
+                    "选完冻结；holdout 与分年数据不得参与选档。",
+        "mode": "band",
+        "band": 0.05,
+        "band_comment": "选中档（定档结果写入此处）。中位只数 = ceil(band × 候选数)，"
+                        "候选数中位约 2160 只 → 5% 约 110 只。"
+                        "改这里等于换策略口径，必须重跑定档段扫描，不要在 holdout 上调。",
+        "band_candidates": [0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.30],
+        "band_candidates_comment": "候选档。业主指定至少要含 top10%/15%/20%/30%，"
+                                   "另加 3%/5%/8% 以便落在 30~200 只的预期规模内。",
+        "expected_positions": [30, 200],
+        "expected_positions_comment": "预期持仓只数区间，只用于卡上提示，不构成门槛（不调档迁就）。",
+    },
     "gate": {
-        "_comment": "硬门槛：两项全过才出建议卡，任一不过输出 fallback。",
+        "_comment": "硬门槛（005R 更新版）：全部通过才出建议卡，任一不过输出 fallback。",
         "dev_min_excess": 0.0,
-        "holdout_max_dd_worse": 0.0,
+        "dev_comment": "dev 段超额（对可投池等权）必须 > 本值。",
+        "period_max_dd_worse": 0.10,
+        "period_comment": "分年各期与 holdout 的回撤，不得比可投池等权深超过本值（10pp）。",
         "holdout_check_direction": True,
+        "direction_comment": "方向检查**只在 dev 通过之后**才做；dev 不过即 fallback，不比方向。",
+    },
+    "validation": {
+        "_comment": "band 的定档段与准样本外分年（业主给的两选一，本单选分年冻结-后验："
+                    "band 是单个离散参数，按月重选主要增加噪声；分年 4 段已能回答"
+                    "'是不是只有某一年行'）。",
+        "method": "yearly_freeze",
+        "band_fit_end": "2021-12-31",
+        "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2021-12-31 共 48 个截面。",
+        "years": ["2022", "2023", "2024", "2025"],
+        "years_comment": "准样本外年份，逐年独立跑。2025 段自动截到 holdout.start 前一日"
+                         "（11 个月的短年，横向比较需注意）。",
     },
     "holdout": {
         "_comment": "holdout 段边界，冻结不许改（factors.DEV_END / HOLDOUT_START 同源）。",
@@ -87,18 +116,22 @@ DEFAULT_SYSTEM: dict = {
         "slippage": 0.001,
     },
     "backtest": {
-        "_comment": "组合回测参数。init_cash 用 100 万：5 只票、单票 20%，一手成本可忽略。",
-        "init_cash": 1000000.0,
+        "_comment": "组合回测参数。init_cash 用 5000 万：等权 100~200 只时一手取整的"
+                    "现金拖累需压到 1% 量级，否则大 k 档位会被模拟误差误杀。"
+                    "该数字与业主真实预算无关。",
+        "init_cash": 50000000.0,
         "lot_size": 100,
     },
 }
 
 DEFAULT_OWNER: dict = {
-    "_comment": "业主画像：只影响仓位与文案，不影响选股口径。手改即可，改完重跑 CLI 生效。",
+    "_comment": "业主画像：只影响卡上文案与资金换算，不影响选股口径。手改即可，改完重跑 CLI 生效。",
     "budget": 100000.0,
-    "budget_comment": "预算金额（元）。仅用于卡上「建议投入多少钱」的换算，不回测。",
+    "budget_comment": "预算金额（元）。用于卡上「每只买多少钱 / 够不够一手 / 最小可行预算」，"
+                      "不回测。",
     "max_drawdown": -0.15,
-    "max_drawdown_comment": "最大可接受回撤（负数）。测试期 -15%。单票上限由它反推。",
+    "max_drawdown_comment": "最大可接受回撤（负数）。测试期 -15%。只在卡上作对照，"
+                            "005R 起不再用它反推单票上限（分散到 100+ 只后单票恒为 1/k）。",
     "holding_period": "monthly",
     "holding_period_comment": "持仓周期：monthly / weekly / long_term。当前策略只有月频口径，"
                               "填别的值会照实提示「策略口径与画像不一致」，不偷偷改策略。",
@@ -178,6 +211,15 @@ def validate(cfg: dict) -> None:
     if not isinstance(owner, dict) or not isinstance(system, dict):
         raise ConfigError("config 必须含 owner / system 两个对象段")
 
+    # ---------- 旧口径拦截 ----------
+    legacy = [k for k in LEGACY_SYSTEM_KEYS if k in system]
+    if legacy:
+        raise ConfigError(
+            f"system 里还有旧口径键 {legacy}：005R 起持仓只数由 portfolio.band 决定"
+            f"（前 N% 等权，单票恒为 1/k），n_hold / max_weight 已删除。"
+            f"请删掉这些键后重跑 `python -m src.advisor --init` 对照新模板。"
+            f"（静默忽略会让配置看起来生效、实际没生效，比报错更危险）")
+
     # ---------- owner ----------
     budget = owner.get("budget")
     if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0:
@@ -195,7 +237,7 @@ def validate(cfg: dict) -> None:
     if not isinstance(owner.get("existing_positions", []), list):
         raise ConfigError("owner.existing_positions 必须是列表")
 
-    # ---------- system ----------
+    # ---------- system.weights ----------
     w = system.get("weights") or {}
     wb, wr = w.get("bp"), w.get("reversal")
     for name, val in (("bp", wb), ("reversal", wr)):
@@ -204,17 +246,45 @@ def validate(cfg: dict) -> None:
     if abs(float(wb) + float(wr) - 1.0) > 1e-6:
         raise ConfigError(f"system.weights 两项必须和为 1，当前 {wb} + {wr} = {float(wb)+float(wr)}")
 
-    n_hold = system.get("n_hold")
-    if not isinstance(n_hold, int) or isinstance(n_hold, bool) or n_hold < 1:
-        raise ConfigError(f"system.n_hold 必须是 >=1 的整数，当前 {n_hold!r}")
-    cap = system.get("max_weight")
-    if not isinstance(cap, (int, float)) or isinstance(cap, bool) or not (0.0 < cap <= 1.0):
-        raise ConfigError(f"system.max_weight 必须在 (0, 1]，当前 {cap!r}")
-    if cap * n_hold < 1.0 - 1e-9:
-        raise ConfigError(
-            f"system.max_weight={cap} × n_hold={n_hold} < 1：单票上限太紧，"
-            f"凑不满 100% 仓位（至少要 {1.0/n_hold:.4f}）")
+    # ---------- system.portfolio ----------
+    port = system.get("portfolio") or {}
+    if port.get("mode") != "band":
+        raise ConfigError(f"system.portfolio.mode 目前只支持 'band'，当前 {port.get('mode')!r}")
+    band = port.get("band")
+    if not isinstance(band, (int, float)) or isinstance(band, bool) or not (0.0 < band <= 1.0):
+        raise ConfigError(f"system.portfolio.band 必须在 (0, 1]，当前 {band!r}")
+    cands = port.get("band_candidates")
+    if not isinstance(cands, list) or len(cands) < 4:
+        raise ConfigError(f"system.portfolio.band_candidates 至少 4 档（业主验收要求），"
+                          f"当前 {cands!r}")
+    for x in cands:
+        if not isinstance(x, (int, float)) or isinstance(x, bool) or not (0.0 < x <= 1.0):
+            raise ConfigError(f"band_candidates 每档必须在 (0, 1]，当前含 {x!r}")
+    if list(cands) != sorted(set(cands)):
+        raise ConfigError(f"band_candidates 必须严格升序且不重复，当前 {cands!r}")
 
+    # ---------- system.gate ----------
+    gate = system.get("gate") or {}
+    if not isinstance(gate.get("dev_min_excess"), (int, float)):
+        raise ConfigError("system.gate.dev_min_excess 必须是数字")
+    ddw = gate.get("period_max_dd_worse")
+    if not isinstance(ddw, (int, float)) or isinstance(ddw, bool) or not (0.0 <= ddw <= 1.0):
+        raise ConfigError(f"system.gate.period_max_dd_worse 必须在 [0, 1]，当前 {ddw!r}")
+
+    # ---------- system.validation ----------
+    val = system.get("validation") or {}
+    if val.get("method") != "yearly_freeze":
+        raise ConfigError(
+            f"system.validation.method 目前只实现 'yearly_freeze'（分年冻结-后验），"
+            f"当前 {val.get('method')!r}。全滚动模式未实现，不许静默按分年跑。")
+    years = val.get("years")
+    if not isinstance(years, list) or not years:
+        raise ConfigError("system.validation.years 必须是非空列表（如 ['2022','2023']）")
+    for y in years:
+        if not (isinstance(y, str) and len(y) == 4 and y.isdigit()):
+            raise ConfigError(f"system.validation.years 每项必须是四位年份字符串，当前含 {y!r}")
+
+    # ---------- veto / filters ----------
     veto = system.get("veto") or {}
     dp = veto.get("debt_ratio_industry_pct_max")
     if not isinstance(dp, (int, float)) or isinstance(dp, bool) or not (0.0 < dp <= 1.0):
@@ -228,15 +298,12 @@ def validate(cfg: dict) -> None:
     if not isinstance(flt.get("min_listed_days", 60), int):
         raise ConfigError("system.filters.min_listed_days 必须是整数")
 
-
-def position_cap(max_drawdown: float, *, crash: float = SINGLE_NAME_CRASH) -> float:
-    """由回撤容忍度反推单票权重上限：cap = |max_drawdown| / crash。
-
-    含义：单票极端跌幅 crash（默认 50%）时，这笔亏损正好等于业主能忍的回撤。
-    容忍 15% → 30%。同时上封 40%（再高就谈不上分散）。
-    """
-    cap = abs(float(max_drawdown)) / float(crash)
-    return float(min(0.40, max(0.01, round(cap, 4))))
+    bt = system.get("backtest") or {}
+    cash = bt.get("init_cash")
+    if not isinstance(cash, (int, float)) or isinstance(cash, bool) or cash <= 0:
+        raise ConfigError(f"system.backtest.init_cash 必须是正数，当前 {cash!r}")
+    if not isinstance(bt.get("lot_size", 100), int) or bt.get("lot_size", 100) < 1:
+        raise ConfigError("system.backtest.lot_size 必须是 >=1 的整数")
 
 
 def save_template(path: str | Path | None = None, *, force: bool = False) -> Path:

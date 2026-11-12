@@ -1,11 +1,11 @@
 {
   "_readme": "本文件两段：owner=业主画像（可手改）/ system=系统参数（dev 定型后写死）。下划线开头的键是说明，程序会忽略。生成：python -m src.advisor --init，出卡：python -m src.advisor",
   "owner": {
-    "_comment": "业主画像：只影响仓位与文案，不影响选股口径。手改即可，改完重跑 CLI 生效。",
+    "_comment": "业主画像：只影响卡上文案与资金换算，不影响选股口径。手改即可，改完重跑 CLI 生效。",
     "budget": 100000.0,
-    "budget_comment": "预算金额（元）。仅用于卡上「建议投入多少钱」的换算，不回测。",
+    "budget_comment": "预算金额（元）。用于卡上「每只买多少钱 / 够不够一手 / 最小可行预算」，不回测。",
     "max_drawdown": -0.15,
-    "max_drawdown_comment": "最大可接受回撤（负数）。测试期 -15%。单票上限由它反推。",
+    "max_drawdown_comment": "最大可接受回撤（负数）。测试期 -15%。只在卡上作对照，005R 起不再用它反推单票上限（分散到 100+ 只后单票恒为 1/k）。",
     "holding_period": "monthly",
     "holding_period_comment": "持仓周期：monthly / weekly / long_term。当前策略只有月频口径，填别的值会照实提示「策略口径与画像不一致」，不偷偷改策略。",
     "existing_positions": [],
@@ -25,7 +25,7 @@
   "system": {
     "_comment": "系统参数：dev 段定型后写死，holdout 段不许回头改。",
     "weights": {
-      "_comment": "综合得分 = bp 分位 × w_bp + 反转分位 × w_rev；两项必须和为 1。实测 dev 段 IC：0.5→+0.0752 / 0.6→+0.0707 / 0.7→+0.0645，反转权重越高组合 IC 越高（见产物 weight_sensitivity）。",
+      "_comment": "综合得分 = bp 分位 × w_bp + 反转分位 × w_rev；两项必须和为 1。实测 dev 段 IC：0.5→+0.0752 / 0.6→+0.0707 / 0.7→+0.0645，反转权重越高组合 IC 越高（见产物 weight_sensitivity）。005R 未改这一层 —— 综合分排序能力为正（t≈4），问题出在持仓形态。",
       "bp": 0.6,
       "reversal": 0.4
     },
@@ -44,14 +44,48 @@
       "exclude_limit_up": true,
       "exclude_limit_up_comment": "截面日或次日开盘涨停的票不可选（次日买不进）。"
     },
-    "n_hold": 5,
-    "max_weight": 0.3,
-    "max_weight_comment": "单票权重上限。默认 30% = 2 × |owner.max_drawdown|，含义是「单票全损（-50%）正好用满业主的回撤预算」。改 owner.max_drawdown 时请同步改这里。",
+    "portfolio": {
+      "_comment": "持仓形态：综合分前 band 比例的全部股票等权持有（005R 业主拍板）。band 由 validation.band_fit_end 之前的定档段扫描确定，选完冻结；holdout 与分年数据不得参与选档。",
+      "mode": "band",
+      "band": 0.05,
+      "band_comment": "选中档（定档结果写入此处）。中位只数 = ceil(band × 候选数)，候选数中位约 2160 只 → 5% 约 110 只。改这里等于换策略口径，必须重跑定档段扫描，不要在 holdout 上调。",
+      "band_candidates": [
+        0.03,
+        0.05,
+        0.08,
+        0.1,
+        0.15,
+        0.2,
+        0.3
+      ],
+      "band_candidates_comment": "候选档。业主指定至少要含 top10%/15%/20%/30%，另加 3%/5%/8% 以便落在 30~200 只的预期规模内。",
+      "expected_positions": [
+        30,
+        200
+      ],
+      "expected_positions_comment": "预期持仓只数区间，只用于卡上提示，不构成门槛（不调档迁就）。"
+    },
     "gate": {
-      "_comment": "硬门槛：两项全过才出建议卡，任一不过输出 fallback。",
+      "_comment": "硬门槛（005R 更新版）：全部通过才出建议卡，任一不过输出 fallback。",
       "dev_min_excess": 0.0,
-      "holdout_max_dd_worse": 0.0,
-      "holdout_check_direction": true
+      "dev_comment": "dev 段超额（对可投池等权）必须 > 本值。",
+      "period_max_dd_worse": 0.1,
+      "period_comment": "分年各期与 holdout 的回撤，不得比可投池等权深超过本值（10pp）。",
+      "holdout_check_direction": true,
+      "direction_comment": "方向检查**只在 dev 通过之后**才做；dev 不过即 fallback，不比方向。"
+    },
+    "validation": {
+      "_comment": "band 的定档段与准样本外分年（业主给的两选一，本单选分年冻结-后验：band 是单个离散参数，按月重选主要增加噪声；分年 4 段已能回答'是不是只有某一年行'）。",
+      "method": "yearly_freeze",
+      "band_fit_end": "2021-12-31",
+      "band_fit_end_comment": "定档段到此为止（含）。2018-01-02~2021-12-31 共 48 个截面。",
+      "years": [
+        "2022",
+        "2023",
+        "2024",
+        "2025"
+      ],
+      "years_comment": "准样本外年份，逐年独立跑。2025 段自动截到 holdout.start 前一日（11 个月的短年，横向比较需注意）。"
     },
     "holdout": {
       "_comment": "holdout 段边界，冻结不许改（factors.DEV_END / HOLDOUT_START 同源）。",
@@ -67,8 +101,8 @@
       "slippage": 0.001
     },
     "backtest": {
-      "_comment": "组合回测参数。init_cash 用 100 万：5 只票、单票 20%，一手成本可忽略。",
-      "init_cash": 1000000.0,
+      "_comment": "组合回测参数。init_cash 用 5000 万：等权 100~200 只时一手取整的现金拖累需压到 1% 量级，否则大 k 档位会被模拟误差误杀。该数字与业主真实预算无关。",
+      "init_cash": 50000000.0,
       "lot_size": 100
     }
   }
