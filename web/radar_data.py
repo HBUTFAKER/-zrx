@@ -20,6 +20,9 @@
     界面显示的灯态日期和回撤值就跟产物不是一回事，等于界面另立一套口径。
     现在灯态与名单截面日的差异**由产物自己写明**：灯态日是基准最新交易日
     （日频），名单截面日是月末，两者分开披露、不强行拉齐。
+
+  - 观察名单简称：`latest.watch_names`（code→简称，005S-M2）。
+    界面只做名称-代码对齐，不自己查名、不猜名；产物没给名称的代码只显示代码。
 """
 from __future__ import annotations
 
@@ -109,6 +112,11 @@ class WatchList:
 
     as_of 是**名单截面日**（月末），与灯态判定日（基准最新交易日）不同，
     两个日期各自展示，不许合并成一个。
+
+    names 是 code→简称 的映射（005S-M2），取自产物 `latest.watch_names`。
+    界面只做名称-代码对齐，**不自己查名称、不猜名称**：
+    产物里没给名称的代码，names 里查不到就是查不到，
+    界面只显示代码、不填占位符（不写"—"、不写"未知"）。
     """
 
     codes: list[str]
@@ -116,6 +124,8 @@ class WatchList:
     universe: int
     rule_text: str
     normal_phase: bool = False
+    #: code→简称 映射；缺名称的代码不在表里（界面据此只显示代码）
+    names: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -205,6 +215,33 @@ def _light_state(payload: dict) -> LightState:
     )
 
 
+def _watch_names(payload: dict) -> dict[str, str]:
+    """读产物 `latest.watch_names`（code→简称），005S-M2。
+
+    这段是**可选增强**而非界面判定依据：
+      - 段本身缺失 → 报错（产物 schema 已声明该段，不许静默降级）；
+      - 某个代码在表里查不到 → 就是查不到，**不占位**（不写"—"、不写"未知"），
+        界面只显示代码。名称是给人看的补充，不是准入条件，
+        缺一个名字不该让整张名单渲染不出来。
+      - 产物另给 `latest.watch_names_missing`（缺失清单），本层不依赖它做判定，
+        只把它透传给界面做披露用；缺失清单为空时说明产物侧已全覆盖。
+    """
+    raw = _require(payload, "latest.watch_names")
+    if not isinstance(raw, dict):
+        raise PayloadError(f"产物 latest.watch_names 类型错：{type(raw).__name__}")
+
+    names: dict[str, str] = {}
+    for code, name in raw.items():
+        code_s = str(code).strip()
+        if not code_s:
+            continue
+        # 名称统一转字符串并去首尾空白；空名称视为"该代码没有名称"
+        name_s = "" if name is None else str(name).strip()
+        if name_s:
+            names[code_s] = name_s
+    return names
+
+
 def payload_path(path: Path | None = None) -> Path:
     """定位产物文件。
 
@@ -244,6 +281,7 @@ def load_payload(path: Path | None = None) -> RadarPayload:
         # 只有**明确判为正常期**才置灰。灯态未判定（None）不是"正常期"，
         # 此时既不给名单也不说"正常期不给建议"，界面报的是"灯态未判定"。
         normal_phase=light.defensive is False,
+        names=_watch_names(payload),
     )
 
     # --- 历史统计 ---

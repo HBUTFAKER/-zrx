@@ -12,6 +12,8 @@
   ⑦ 运行时零大模型接口：界面模块不得 import 任何 LLM SDK
   ⑧ S4-M1：灯态直读产物 `latest.light_state`，不自算；
      灯态判定日与名单截面日分别展示、不合并
+  ⑨ S4-M2：Top100 表格接入 `latest.watch_names`，代码旁显示简称；
+     缺名称的只显示代码、不占位
 """
 from __future__ import annotations
 
@@ -214,11 +216,11 @@ class TestRender:
         assert RD.TXT_NORMAL_PHASE not in watch_block, "防守期不应再显示正常期文案"
         assert RD.TXT_DEFENSE_ONLY in watch_block
 
-        # Top100 表格真渲染：名次 + 代码两列，100 行，顺序与产物一致
+        # Top100 表格真渲染：名次 + 代码 + 名称三列，100 行，顺序与产物一致
         frames = [df.value for df in at.dataframe]
         assert frames, "防守期没有渲染任何表格"
         watch_frame = frames[0]
-        assert list(watch_frame.columns) == ["名次", "代码"]
+        assert list(watch_frame.columns) == ["名次", "代码", "名称"]
         codes_in_table = [str(c) for c in watch_frame["代码"].tolist()]
         assert len(codes_in_table) == 100
         assert codes_in_table == raw_payload["latest"]["watch"], "防守期 Top100 未按产物顺序渲染"
@@ -479,3 +481,166 @@ class TestLightStateFromProduct:
         p.write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
         with pytest.raises(PayloadError):
             load_payload(p)
+
+
+# ================================================================= S4-M2 名称显示
+class TestWatchNames:
+    """S4-M2：Top100 表格接入 `latest.watch_names`，代码旁显示简称。
+
+    硬约束：
+      - 名称逐字取自产物，界面不自己查名、不猜名；
+      - 缺名称的股票**只显示代码、不占位**（不写"—"、不写"未知"）；
+      - 名称列与代码列严格同行对齐，顺序跟产物一致。
+    """
+
+    @staticmethod
+    def _defensive_frame(tmp_path, raw_payload):
+        """跑防守期分支，返回 Top100 表格 DataFrame。"""
+        from streamlit.testing.v1 import AppTest
+
+        p = _variant_payload(
+            tmp_path, raw_payload, state="defensive", drawdown=-0.123, light_as_of="2026-11-09"
+        )
+        os.environ[RD.PAYLOAD_ENV] = str(p)
+        try:
+            at = AppTest.from_file(str(ROOT / "web" / "app.py"), default_timeout=60)
+            at.run()
+        finally:
+            os.environ.pop(RD.PAYLOAD_ENV, None)
+        assert len(at.exception) == 0, [e.value for e in at.exception]
+        frames = [df.value for df in at.dataframe]
+        assert frames, "防守期没有渲染任何表格"
+        frame = frames[0]
+        # 必须确认拿到的是 Top100 表格，而不是历史明细表（否则断言会误导）
+        assert list(frame.columns) == ["名次", "代码", "名称"], (
+            f"拿到的不是 Top100 表格：{list(frame.columns)}"
+        )
+        return frame
+
+    def test_names_loaded_from_product(self, payload, raw_payload):
+        """names 段必须与产物 `latest.watch_names` 逐字一致。"""
+        raw_names = raw_payload["latest"]["watch_names"]
+        assert payload.watch.names == {str(k): str(v) for k, v in raw_names.items()}
+        assert len(payload.watch.names) == 100
+
+    def test_names_cover_all_watch_codes(self, payload):
+        """本产物 missing=0：名单里每只股票都有名称。"""
+        codes = set(payload.watch.codes)
+        assert codes.issubset(set(payload.watch.names)), (
+            "名单里有代码没名称，测试前提失效"
+        )
+        assert payload.watch.names.get(payload.watch.codes[0]), "首位股票没有名称"
+
+    def test_defensive_table_renders_name_column(self, tmp_path, raw_payload):
+        """防守期 Top100 表格必须真渲染出名称，且与产物逐字一致。"""
+        frame = self._defensive_frame(tmp_path, raw_payload)
+        assert list(frame.columns) == ["名次", "代码", "名称"]
+
+        codes = [str(c) for c in frame["代码"].tolist()]
+        names = [str(n) for n in frame["名称"].tolist()]
+        raw_names = raw_payload["latest"]["watch_names"]
+
+        assert len(codes) == 100
+        assert len(names) == 100
+        assert codes == raw_payload["latest"]["watch"]
+        # 每行的名称必须就是该代码在产物里登记的简称（同行对齐）
+        for code, name in zip(codes, names):
+            assert name == raw_names[code], f"{code} 的名称与产物不一致"
+
+    def test_name_column_aligns_with_code_row(self, tmp_path, raw_payload):
+        """名称与代码同行对齐：把首行代码换掉，名称必须跟着变。"""
+        frame = self._defensive_frame(tmp_path, raw_payload)
+        raw_names = raw_payload["latest"]["watch_names"]
+        first_code = str(frame["代码"].iloc[0])
+        assert str(frame["名称"].iloc[0]) == raw_names[first_code]
+        # 第 50 行也校验一次，避免整体错位一格这种偏移
+        mid_code = str(frame["代码"].iloc[49])
+        assert str(frame["名称"].iloc[49]) == raw_names[mid_code]
+
+    def test_missing_name_shows_code_only_no_placeholder(self, tmp_path, raw_payload):
+        """缺名称的股票：只显示代码，名称留空，**不填占位符**。"""
+        r = json.loads(json.dumps(raw_payload))
+        # 切到防守期，否则名单块不渲染表格（正常期只报状态）
+        r["latest"]["light_state"]["state"] = "defensive"
+        # 挖掉前 3 只的名称，模拟产物侧名称缺失
+        dropped = r["latest"]["watch"][:3]
+        for c in dropped:
+            r["latest"]["watch_names"].pop(c, None)
+        r["latest"]["watch_names_missing"] = list(dropped)
+        p = tmp_path / "missing_names.json"
+        p.write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
+
+        pl = load_payload(p)
+        for c in dropped:
+            assert c not in pl.watch.names, f"{c} 不该有名称"
+
+        os.environ[RD.PAYLOAD_ENV] = str(p)
+        try:
+            from streamlit.testing.v1 import AppTest
+
+            at = AppTest.from_file(str(ROOT / "web" / "app.py"), default_timeout=60)
+            at.run()
+        finally:
+            os.environ.pop(RD.PAYLOAD_ENV, None)
+        assert len(at.exception) == 0, [e.value for e in at.exception]
+
+        frames = [df.value for df in at.dataframe]
+        assert frames, "缺名称时表格都没渲染出来"
+        frame = frames[0]
+        assert list(frame.columns) == ["名次", "代码", "名称"], (
+            f"拿到的不是 Top100 表格：{list(frame.columns)}"
+        )
+        names = [str(n) for n in frame["名称"].tolist()]
+        codes = [str(c) for c in frame["代码"].tolist()]
+
+        # 缺名称的三行：名称为空字符串，不是"—"/"未知"/"None"
+        for c in dropped:
+            idx = codes.index(c)
+            assert names[idx] == "", f"{c} 的名称应为空，实为 {names[idx]!r}"
+        assert "—" not in names, "缺名称处不许出现破折号占位"
+        assert "未知" not in names, "缺名称处不许出现'未知'占位"
+        assert "None" not in names, "缺名称处不许出现 None 占位"
+
+        # 名单本身照常展示 100 行 —— 缺名字不该挡住名单
+        assert len(codes) == 100
+
+    def test_empty_name_treated_as_missing(self, tmp_path, raw_payload):
+        """产物里名称为空串 → 视为没有名称，不落进 names 表。"""
+        r = json.loads(json.dumps(raw_payload))
+        target = r["latest"]["watch"][0]
+        r["latest"]["watch_names"][target] = "   "
+        p = tmp_path / "empty_name.json"
+        p.write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
+        pl = load_payload(p)
+        assert target not in pl.watch.names
+
+    def test_missing_watch_names_section_raises(self, tmp_path, raw_payload):
+        """产物缺 watch_names 段必须报错，不许静默降级成"无名称"。"""
+        r = json.loads(json.dumps(raw_payload))
+        del r["latest"]["watch_names"]
+        p = tmp_path / "no_watch_names.json"
+        p.write_text(json.dumps(r, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(PayloadError):
+            load_payload(p)
+
+    def test_no_self_looked_up_names(self):
+        """界面层不许自己查名称（不许出现网络/行情查询调用）。"""
+        for f in ("app.py", "radar_data.py"):
+            src = (ROOT / "web" / f).read_text(encoding="utf-8")
+            for pat in (
+                "read_parquet", "akshare", "tushare", "baostock",
+                "yfinance", "requests.get", "urlopen", "httpx.",
+            ):
+                assert pat not in src, f"web/{f} 含自行取数调用：{pat}"
+
+    def test_names_do_not_leak_into_normal_phase(self, tmp_path, raw_payload):
+        """正常期：名单置灰，名称也不许露出（名称跟代码同门控）。"""
+        from streamlit.testing.v1 import AppTest
+
+        at = AppTest.from_file(str(ROOT / "web" / "app.py"), default_timeout=60)
+        at.run()
+        text = TestRender._all_text(at)
+        raw_names = raw_payload["latest"]["watch_names"]
+        # 只抽查前若干个简称，避免误伤页脚里的普通词
+        for code in raw_payload["latest"]["watch"][:5]:
+            assert raw_names[code] not in text, f"正常期泄露名单名称：{raw_names[code]}"
