@@ -2,23 +2,24 @@
 
 ## 边界（改代码前先看）
 
-  ① **运行时零大模型接口。** 本模块只读确定性产物 + 本地 parquet，
+  ① **运行时零大模型接口。** 本模块只读确定性产物 JSON，
      不 import 任何 LLM SDK，不发任何网络请求。
-  ② **只读。** 只 `json.load` / `pd.read_parquet`，不写不改任何文件。
+  ② **只读。** 只 `json.load`，不写不改任何文件。
   ③ **不改 src/。** 研究与引擎层归施工A，本文件属界面层，
-     只调用 `src.radar_005s` 的纯函数，不修改它的任何一行。
+     不修改 src/ 的任何一行（005S-M1 起连引擎层都不再调用 ——
+     灯态由产物写死，界面只读）。
 
 ## 数据来源
 
-  - 卡片主体：`out/005s_validation.json`（施工A 的 005S 产物，schema_version=005S-2）
-  - 状态灯当前态：`data/raw/index/hs300_total_return_2026-11-09.parquet`
-    → 用 `src.radar_005s.state_light` 按同一口径重算。
+  - 卡片主体：`out/005s_validation.json`（施工A 的 005S 产物，schema_version=005S-3）
+  - 状态灯当前态：同一份产物的 `latest.light_state` 段
+    —— 005S-R3 起由施工A 在产物里写死（state/as_of/drawdown/window/threshold/rule），
+    界面**直接读**，不再从基准 parquet 自行重算。
 
-    为什么 JSON 里没有当前灯态：JSON 的 `light` 段只有历史 60 个月的
-    防守月统计（2021-01~2025-12），`latest` 段只有名单与 as_of 日期，
-    **没有「今天是不是防守期」这一位**。界面必须显示当前态，
-    所以按 JSON 里写死的同一套规则（`light.window=20` / `light.threshold=0.1`）
-    从基准收盘序列重算 —— 规则同源、结果可复算，不引入第二套口径。
+    为什么不再自算（005S-M1）：自算口径与产物面板对不上时，
+    界面显示的灯态日期和回撤值就跟产物不是一回事，等于界面另立一套口径。
+    现在灯态与名单截面日的差异**由产物自己写明**：灯态日是基准最新交易日
+    （日频），名单截面日是月末，两者分开披露、不强行拉齐。
 """
 from __future__ import annotations
 
@@ -34,9 +35,6 @@ PAYLOAD_REL = "out/005s_validation.json"
 
 #: 产物路径覆盖环境变量（测试用：指向另造一份 JSON 来驱动界面分支）
 PAYLOAD_ENV = "RADAR_PAYLOAD"
-
-#: 基准 parquet 路径覆盖环境变量（测试用：换一份序列驱动防守期分支）
-BENCHMARK_ENV = "RADAR_BENCHMARK"
 
 # 文案硬约束：逐字照抄，不许美化、不许改标点
 TXT_SAMPLE_WARNING = "5 个防守月中 4 个合格，样本极小，仅定性参考"
@@ -79,15 +77,23 @@ class PayloadError(RuntimeError):
 
 @dataclass(frozen=True)
 class LightState:
-    """状态灯当前态。
+    """状态灯当前态（直读产物 `latest.light_state`，界面不自行判定）。
 
-    defensive=True  防守期（回撤已达阈值）
-    defensive=False 正常期
+    defensive=True   防守期（回撤已达阈值）
+    defensive=False  正常期
+    defensive=None   **未判定**：产物 state 为 null，
+                     表示该交易日无基准收盘或缺前置窗口。
+                     这种状态既不是防守期也不是正常期，
+                     界面必须原样显示"未判定"，绝不许当成"正常期"——
+                     把"没算出来"显示成"安全"等于凭空放宽。
+
+    threshold 为**负数**（与产物一致，如 -0.1），判定式：
+        drawdown <= threshold → 防守期
     """
 
-    defensive: bool
+    defensive: bool | None
     as_of: str
-    drawdown: float
+    drawdown: float | None
     window: int
     threshold: float
     rule_text: str
@@ -95,7 +101,15 @@ class LightState:
 
 @dataclass(frozen=True)
 class WatchList:
-    """观察名单。normal 期间名单依然存在，但界面必须置灰不展示内容。"""
+    """观察名单。
+
+    normal_phase=True 只在灯态**明确为正常期**时成立；
+    灯态未判定（None）时 normal_phase=False —— 未判定既不是防守期也不是正常期，
+    界面不进入"正常期只报状态"分支，也不展示名单内容，而是报"灯态未判定"。
+
+    as_of 是**名单截面日**（月末），与灯态判定日（基准最新交易日）不同，
+    两个日期各自展示，不许合并成一个。
+    """
 
     codes: list[str]
     as_of: str
@@ -152,42 +166,42 @@ def _require(payload: dict, path: str):
     return cur
 
 
-def _current_light(window: int, threshold: float, rule_text: str) -> LightState:
-    """按产物写死的规则重算当前灯态。
+def _light_state(payload: dict) -> LightState:
+    """直读产物 `latest.light_state`，不再自行重算灯态（005S-M1）。
 
-    优先读产物里声明的基准 parquet 路径；基准文件不在时**报错**，
-    不拿别处的数据凑 —— 灯态错一次，整个界面的建议方向就反了。
+    产物里写死的字段逐字照抄，界面只做展示：
+        state     —— "defensive" / "normal" / null（null = 该日无法判定）
+        as_of     —— 灯态判定日（基准最新交易日）
+        drawdown  —— 判定日回撤
+        window    —— 回撤窗口
+        threshold —— 阈值（负数，判定式 drawdown <= threshold → 防守期）
+        rule      —— 产物写明的灯规则原文
 
-    基准路径覆盖环境变量 ``RADAR_BENCHMARK``（测试用）：
-    换成一份能把灯压到阈值以下的序列，即可驱动防守期分支。
+    `state` 为 null 时 `defensive` 保持 None（未判定），
+    不许默认成 False —— 那会把"算不出来"显示成"正常期"。
     """
-    from src.radar_005s import load_benchmark, rolling_drawdown, state_light
+    ls = _require(payload, "latest.light_state")
 
-    bench_override = os.environ.get(BENCHMARK_ENV)
-    try:
-        if bench_override:
-            import pandas as pd
+    state = ls.get("state")
+    if state is None:
+        defensive: bool | None = None
+    elif state == "defensive":
+        defensive = True
+    elif state == "normal":
+        defensive = False
+    else:
+        raise PayloadError(f"产物 light_state.state 词表外取值：{state!r}")
 
-            df = pd.read_parquet(bench_override)
-            close = df.set_index("date")["close"].astype("float64").sort_index()
-            close.index = close.index.astype(str)
-        else:
-            close = load_benchmark()
-    except (FileNotFoundError, OSError, KeyError, ValueError) as exc:
-        raise PayloadError(f"基准收盘序列读取失败，状态灯无法判定：{exc}") from exc
-    if len(close) == 0:
-        raise PayloadError("基准收盘序列为空，状态灯无法判定")
+    raw_dd = ls.get("drawdown")
+    drawdown = None if raw_dd is None else float(raw_dd)
 
-    light = state_light(close, window=window, threshold=threshold)
-    dd = rolling_drawdown(close, window=window)
-    last = close.index[-1]
     return LightState(
-        defensive=bool(light[last]),
-        as_of=str(last),
-        drawdown=float(dd[last]),
-        window=window,
-        threshold=float(threshold),
-        rule_text=rule_text,
+        defensive=defensive,
+        as_of=str(_require(ls, "as_of")),
+        drawdown=drawdown,
+        window=int(_require(ls, "window")),
+        threshold=float(_require(ls, "threshold")),
+        rule_text=str(ls.get("rule", "")),
     )
 
 
@@ -207,7 +221,7 @@ def payload_path(path: Path | None = None) -> Path:
 
 
 def load_payload(path: Path | None = None) -> RadarPayload:
-    """装载 005S 产物 + 重算当前状态灯。"""
+    """装载 005S 产物（含产物写死的当前灯态）。"""
     p = payload_path(path)
     if not p.exists():
         raise PayloadError(f"产物不存在：{p}")
@@ -215,11 +229,8 @@ def load_payload(path: Path | None = None) -> RadarPayload:
     with p.open("r", encoding="utf-8") as fh:
         payload = json.load(fh)
 
-    # --- 状态灯 ---
-    rule_light = _require(payload, "rules.light")
-    window = int(_require(payload, "light.window"))
-    threshold = float(_require(payload, "light.threshold"))
-    light = _current_light(window, threshold, rule_light)
+    # --- 状态灯（直读产物 latest.light_state，不自算）---
+    light = _light_state(payload)
 
     # --- 观察名单（避雷名单已判失败，本界面不读 latest.avoid）---
     watch_codes = list(_require(payload, "latest.watch"))
@@ -230,7 +241,9 @@ def load_payload(path: Path | None = None) -> RadarPayload:
         as_of=as_of,
         universe=universe,
         rule_text=str(_require(payload, "rules.watch")),
-        normal_phase=not light.defensive,
+        # 只有**明确判为正常期**才置灰。灯态未判定（None）不是"正常期"，
+        # 此时既不给名单也不说"正常期不给建议"，界面报的是"灯态未判定"。
+        normal_phase=light.defensive is False,
     )
 
     # --- 历史统计 ---

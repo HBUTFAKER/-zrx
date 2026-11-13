@@ -20,6 +20,9 @@
        「本名单只在防守期有价值；2024、2025 反弹行情跑输基准」
        「本产物不构成投资建议」
   ④ **免责声明常驻**：不因任何交互而消失。
+  ⑤ **灯态直读产物**（005S-M1）：不自行重算，不读基准 parquet。
+  ⑥ **两个日期分开**（005S-M1）：灯态判定日（基准最新交易日，日频）
+     与名单截面日（月末）语义不同、各自展示，**不许合并成同一个日期**。
 
 ## 启动
 
@@ -86,16 +89,24 @@ def render_light(p: RadarPayload) -> None:
     st.markdown('<div class="block-title">① 市场状态灯</div>', unsafe_allow_html=True)
     light = p.light
 
-    if light.defensive:
+    if light.defensive is True:
         color, label = "#ef4444", "🔴 防守期"
-    else:
+    elif light.defensive is False:
         color, label = "#22c55e", "🟢 正常期"
+    else:
+        # 产物 state 为 null：该交易日无法判定。
+        # 绝不显示成"正常期"—— 把"没算出来"说成"安全"等于凭空放宽。
+        color, label = "#a3a3a3", "⚪ 未判定"
 
+    # 阈值在产物里是负数（-0.1），直接格式化会印出 "-−10%"，取绝对值再补符号。
+    thr = abs(light.threshold) * 100
+
+    dd_txt = _pct(light.drawdown) if light.drawdown is not None else "—"
     st.markdown(
         f'<div class="light-big" style="color:{color};">{label}</div>'
-        f'<div class="light-date">判定日期：{light.as_of}'
-        f'（相对过去 {light.window} 个交易日最高收盘回撤 {_pct(light.drawdown)}，'
-        f'阈值 −{light.threshold * 100:.0f}%）</div>'
+        f'<div class="light-date">灯态判定日：{light.as_of}'
+        f'（相对过去 {light.window} 个交易日最高收盘回撤 {dd_txt}，'
+        f'阈值 −{thr:.0f}%）</div>'
         f'<div class="rule-text">灯规则：{light.rule_text}</div>',
         unsafe_allow_html=True,
     )
@@ -109,12 +120,38 @@ def render_watch(p: RadarPayload) -> None:
     st.markdown(f'<div class="rule-text">名单规则：{watch.rule_text}</div>',
                 unsafe_allow_html=True)
 
+    # 名单截面日：与灯态判定日不同，两个日期分开写，不合并。
+    st.markdown(
+        f'<div class="rule-text">名单截面日：{watch.as_of}'
+        f'（灯态判定日 {p.light.as_of}，两者不同，名单不随灯态日滚动）</div>',
+        unsafe_allow_html=True,
+    )
+
+    if p.light.defensive is None:
+        # 灯态未判定：既不是防守期也不是正常期。
+        # 不展示名单内容，也不冒充"正常期只报状态"——那是另一回事。
+        st.markdown(
+            f'<div class="grayed">'
+            f'<div class="light-big" style="font-size:2.2rem;">名单未展示</div>'
+            f'<div class="rule-text">灯态未判定，无法确定当前是否防守期</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="notice">灯态未判定，本次不展示名单内容</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f'<div class="rule-text">{TXT_DEFENSE_ONLY}</div>', unsafe_allow_html=True
+        )
+        return
+
     if watch.normal_phase:
         # 正常期：置灰 + 只报状态，不给任何名单内容
         st.markdown(
             f'<div class="grayed">'
             f'<div class="light-big" style="font-size:2.2rem;">名单已置灰</div>'
-            f'<div class="rule-text">共 {len(watch.codes)} 只（名单形成日 {watch.as_of}）</div>'
+            f'<div class="rule-text">共 {len(watch.codes)} 只</div>'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -129,8 +166,7 @@ def render_watch(p: RadarPayload) -> None:
         return
 
     st.markdown(
-        f'<div class="rule-text">名单形成日 {watch.as_of}｜可投池 {watch.universe} 只'
-        f'｜名单 {len(watch.codes)} 只</div>',
+        f'<div class="rule-text">可投池 {watch.universe} 只｜名单 {len(watch.codes)} 只</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
