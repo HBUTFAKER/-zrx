@@ -258,25 +258,29 @@ def test_product_latest_block_contract():
     if d.get("schema_version") != "005S-3":
         pytest.skip(f"磁盘上是旧产物 {d.get('schema_version')}，新字段等重出后再校验")
     lt = d["latest"]
-    assert lt["light_state"]["state"] in ("defensive", "normal")
-    assert lt["light_state"]["as_of"] == lt["as_of"]
+    ls = lt["light_state"]
+    assert ls["state"] in ("defensive", "normal")
+    # 灯按基准最新交易日：不早于名单截面日，两个日期各自独立
+    assert ls["as_of"] >= lt["as_of"]
+    assert (ls["state"] == "defensive") == (ls["drawdown"] <= ls["threshold"] + 1e-12)
     assert set(lt["watch_names"]).issubset(set(lt["watch"]))
     assert set(lt["watch_names"]) | set(lt["watch_names_missing"]) == set(lt["watch"])
     assert all(isinstance(v, str) and v for v in lt["watch_names"].values())
 
 
 def test_latest_block_assembles_light_and_names():
-    """latest 段组装：同日灯态 + 名称映射 + 未匹配清单，字段一个不少。"""
+    """latest 段组装：灯按基准最新日、名单按月末日，两个日期分开写。"""
     idx = [f"2024-04-{i:02d}" for i in range(1, 29)]
     px = pd.Series([100.0] * 27 + [88.0], index=idx)
-    latest = {"date": idx[-1], "n_universe": 2100,
+    latest = {"date": idx[-3], "n_universe": 2100,
               "watch_codes": ["sh.600000", "sz.000001", "sh.600999"],
               "avoid_codes": ["sh.600001"]}
     blk = latest_block(latest, state_light(px), rolling_drawdown(px),
                        {"sh.600000": "浦发银行", "sz.000001": "平安银行"})
-    assert blk["as_of"] == "2024-04-28" and blk["universe"] == 2100
+    assert blk["as_of"] == "2024-04-26" and blk["universe"] == 2100
     assert blk["light_state"]["state"] == "defensive"
-    assert blk["light_state"]["as_of"] == blk["as_of"]
+    # 灯取基准最新交易日，允许晚于名单截面日；不许强行拉齐
+    assert blk["light_state"]["as_of"] == "2024-04-28" != blk["as_of"]
     assert blk["watch"] == latest["watch_codes"] and blk["avoid"] == ["sh.600001"]
     assert blk["watch_names"] == {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
     assert blk["watch_names_missing"] == ["sh.600999"]

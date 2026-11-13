@@ -128,15 +128,21 @@ def names_for(codes: list[str], names: dict[str, str]) -> tuple[dict[str, str], 
 
 def latest_block(latest: dict, light: pd.Series, dd: pd.Series,
                  names: dict[str, str]) -> dict:
-    """产物 latest 段：名单 + 同日灯态快照 + 名称映射（005S-R3 字段补全）。
+    """产物 latest 段：名单 + 灯态快照 + 名称映射（005S-R3 字段补全）。
 
-    单独抽出来是为了可测：这段是施工B 的唯一读取口，不能靠"跑一遍真实数据
-    看看有没有字段"来验证。
+    两个日期**故意不同**，各自都写进产物：
+      · `as_of`        —— 名单截面日（月末收盘，出名单那天）
+      · `light_state.as_of` —— 基准最新交易日（灯是日频，取最新一根收盘）
+    实测数据里基准比面板晚收几天（基准 2026-11-09 / 面板 2026-11-06），
+    若强行统一成名单日，界面按 JSON 显示的灯会比它自己重算的旧几天。
+
+    单独抽出来是为了可测：这段是施工B 的唯一读取口。
     """
-    date = str(latest["date"])
+    list_date = str(latest["date"])
+    light_date = str(dd.index[-1]) if len(dd) else list_date
     mapping, missing = names_for(latest["watch_codes"], names)
     return {"as_of": latest["date"], "universe": int(latest["n_universe"]),
-            "light_state": light_snapshot(light, dd, date),
+            "light_state": light_snapshot(light, dd, light_date),
             "watch": latest["watch_codes"], "watch_names": mapping,
             "watch_names_missing": missing,
             "avoid": latest["avoid_codes"]}
@@ -364,7 +370,7 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
 
     latest_end = ends[-1]
     latest = rank_lists(fd, latest_end, system, mats, amount)
-    # 灯态快照与两份名单取**同一个截面日**，避免"名单是上周的、灯是今天的"。
+    # 灯态按基准**最新交易日**给（日频），名单按月末截面给；两个日期各自写进产物。
     latest_info = latest_block(latest, light, rolling_drawdown(bench, DD_WINDOW),
                                load_names())
     return {
@@ -403,7 +409,8 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
             "名单月末出、次月持有，检验期不参与任何选择；不插补、不加权、不择时。",
             "持有期收益为零成本口径（雷达不交易），实际执行成本另计。",
             "基准唯一：沪深300全收益 H00300。",
-            "latest.light_state 是最近截面日（as_of）当天的灯态，与两份名单同一截面；"
+            "latest.light_state 按基准最新交易日判定（日频），可能与名单截面日 "
+            "latest.as_of 不同：两个日期分别写在各自字段里，不强行对齐；"
             "state 为 null 表示该日无法判定，不默认成 normal。",
             "latest.watch_names 来自 data/cache.db 的 stocks.code_name，只用于展示；"
             "查不到的名称列在 watch_names_missing，不插补、不用占位符顶替。"],
