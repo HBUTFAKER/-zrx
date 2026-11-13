@@ -1,0 +1,169 @@
+"""005S 防守雷达测试（状态灯 / 两张名单 / 达标统计 / 配置护栏）。
+
+硬断言，不放宽：
+  1. **无未来函数**：把 T 之后的基准价格整体污染，T 及之前的灯态必须逐位相同。
+  2. **阈值边界**：回撤 -10.0% 亮、-9.0% 不亮（不许四舍五入放宽）。
+  3. **名单方向**：观察名单取低波高分位、避雷名单取高波低分位，两张名单不许重叠。
+  4. **达标线**：占比 70% 恰过、69% 不过（不四舍五入凑过）。
+  5. **产物不许覆盖作废留档**：config 指向 advice_card.json 必须报错。
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import src.config as C  # noqa: E402
+from src.radar_005s import (AVOID_SPEC, WATCH_FACTORS, month_flags,  # noqa: E402
+                            rolling_drawdown, score_lists, state_light, summarize)
+
+
+# ---------------------------------------------------------------- 1. 无未来函数
+
+def test_state_light_ignores_future_prices():
+    rng = np.random.default_rng(11)
+    n = 200
+    px = pd.Series(100.0 * np.cumprod(1.0 + rng.normal(0.0005, 0.015, n)),
+                   index=[f"2024-{1 + i // 28:02d}-{1 + i % 28:02d}" for i in range(n)])
+    base = state_light(px)
+
+    corrupted = px.copy()
+    corrupted.iloc[102:] *= 0.4          # T=102 起整体砸盘（T=101 当日价不许动）
+    after = state_light(corrupted)
+
+    # 第 101 日的灯只用 ≤101 的价格，必须一模一样
+    assert np.array_equal(base.iloc[:102].to_numpy(), after.iloc[:102].to_numpy())
+    # 且污染确实生效（否则这条测试等于没测）
+    assert after.iloc[102:].any()
+
+
+def test_rolling_drawdown_uses_right_aligned_window():
+    """窗口右端就是当日：当天创新高 → 回撤 0，不会因为"以后会跌"提前变负。"""
+    px = pd.Series([10.0] * 25 + [9.0], index=[f"d{i}" for i in range(26)])
+    dd = rolling_drawdown(px, 20)
+    assert dd.iloc[24] == 0.0
+    assert abs(dd.iloc[25] - (-0.10)) < 1e-12
+
+
+# ---------------------------------------------------------------- 2. 阈值边界
+
+def test_state_light_threshold_boundary():
+    base = [100.0] * 25
+    lit = state_light(pd.Series(base + [90.0], index=[f"d{i}" for i in range(26)]))
+    assert bool(lit.iloc[-1]) is True, "-10.0% 必须亮"
+    not_lit = state_light(pd.Series(base + [91.0], index=[f"d{i}" for i in range(26)]))
+    assert bool(not_lit.iloc[-1]) is False, "-9.0% 不许亮"
+
+
+def test_month_flags_any_single_day_lights_the_month():
+    dates = ["2022-01-27", "2022-01-28", "2022-02-07", "2022-02-08"]
+    light = pd.Series([False, True, False, False], index=dates)
+    flags = month_flags(dates, light)
+    assert flags["2022-01"]["defensive"] is True
+    assert flags["2022-01"]["first_defensive"] == "2022-01-28"
+    assert flags["2022-01"]["month_end_state"] is True     # 月末那天也亮
+    assert flags["2022-02"]["defensive"] is False
+    assert flags["2022-01"]["n_days"] == 2
+
+
+# ---------------------------------------------------------------- 3. 名单方向
+
+def _mats(n: int = 300) -> dict[str, np.ndarray]:
+    idx = np.arange(n, dtype="float64")
+    arr = lambda v: v.reshape(1, n)  # noqa: E731
+    # 三个因子都"索引越大越好"；reversal_60 同步升序，便于断定避雷名单应落在另一端
+    return {"lowvol_20": arr(idx / n), "lowvol_60": arr(idx / n),
+            "turn_stab_60": arr(idx / n), "reversal_60": arr(idx / n)}
+
+
+def test_score_lists_direction_and_size():
+    mats = _mats(300)
+    mask = np.ones(300, dtype=bool)
+    mask[0] = False                      # 唯一一只被否决的票不许出现在任何名单
+    out = score_lists(mats, 0, mask, top_n=100)
+
+    assert len(out["watch"]) == 100 and len(out["avoid"]) == 100
+    assert 0 not in out["watch"] and 0 not in out["avoid"]
+    # 观察 = 三个"越大越好"因子的高分位 → 索引偏大；避雷 = 低分位 → 索引偏小
+    assert out["watch"].min() > out["avoid"].max()
+    assert not set(out["watch"].tolist()) & set(out["avoid"].tolist())
+    assert out["n_watch_pool"] == 299 and out["n_avoid_pool"] == 299
+
+
+def test_score_lists_skips_nan_instead_of_imputing():
+    mats = _mats(300)
+    mats["lowvol_60"][0, :50] = np.nan          # 50 只缺 60 日窗口
+    out = score_lists(mats, 0, np.ones(300, dtype=bool), top_n=100)
+    assert out["n_watch_pool"] == 250           # 缺值的不插补，直接不进候选
+
+
+def test_watch_and_avoid_spec_cover_004c_factors():
+    """观察用低波+换手稳；避雷必须含高波/换手不稳/过去跌得多三路。"""
+    assert set(WATCH_FACTORS) == {"lowvol_20", "lowvol_60", "turn_stab_60"}
+    assert {n for n, _, _ in AVOID_SPEC} == {"lowvol_20", "turn_stab_60", "reversal_60"}
+    assert abs(sum(w for _, _, w in AVOID_SPEC) - 1.0) < 1e-12
+
+
+# ---------------------------------------------------------------- 4. 达标线
+
+def _watch_rows(n_ok: int, n: int = 10) -> list[dict]:
+    rows = [{"excess": 0.01, "strategy_mdd": -0.10, "bench_mdd": -0.12} for _ in range(n_ok)]
+    rows += [{"excess": -0.01, "strategy_mdd": -0.10, "bench_mdd": -0.12}
+             for _ in range(n - n_ok)]
+    return rows
+
+
+def test_summarize_watch_pass_rate_boundary():
+    assert summarize(_watch_rows(7), kind="watch")["passed"] is True       # 7/10 恰过
+    assert summarize(_watch_rows(6), kind="watch")["passed"] is False      # 6/10 不过
+    assert summarize(_watch_rows(7), kind="watch")["pass_rate"] == 0.7
+
+
+def test_summarize_watch_requires_shallower_drawdown():
+    """超额为正但回撤更深 → 当月不合格（两条都要）。"""
+    rows = _watch_rows(7) + [{"excess": 0.02, "strategy_mdd": -0.30, "bench_mdd": -0.12}] * 3
+    out = summarize(rows, kind="watch")
+    assert out["n_months"] == 13 and out["n_qualified"] == 7
+    assert out["passed"] is False                  # 7/13 < 70%
+
+
+def test_summarize_avoid_needs_underperformance():
+    rows = [{"strategy_ret": -0.05, "bench_ret": -0.02}] * 8
+    rows += [{"strategy_ret": 0.03, "bench_ret": 0.01}] * 2
+    out = summarize(rows, kind="avoid")
+    assert out["n_qualified"] == 8 and out["pass_rate"] == 0.8 and out["passed"] is True
+
+
+# ---------------------------------------------------------------- 5. 配置护栏
+
+def _cfg_with(**card):
+    c = C.default_config()
+    c["system"]["advice_card"].update(card)
+    return c
+
+
+@pytest.mark.parametrize("card,msg", [
+    ({"mode": "buy_list"}, "advice_card.mode"),
+    ({"output": "out/advice_card.json"}, "不许指向作废留档"),
+    ({"output": "out/004c_c2_validation.json"}, "不许指向作废留档"),
+    ({"output": "out/radar.txt"}, ".json"),
+])
+def test_config_rejects_bad_advice_card(tmp_path, card, msg):
+    p = tmp_path / "c.json"
+    p.write_text(__import__("json").dumps(_cfg_with(**card)), encoding="utf-8")
+    with pytest.raises(C.ConfigError) as e:
+        C.load_config(p)
+    assert msg in str(e.value)
+
+
+def test_default_advice_card_mode_is_radar():
+    s = C.default_config()["system"]["advice_card"]
+    assert s["mode"] == "radar_005s"
+    assert s["output"] == "out/005s_validation.json"
+    assert "out/advice_card.json" in s["legacy_outputs"]

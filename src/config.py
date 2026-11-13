@@ -100,6 +100,13 @@ DEFAULT_SYSTEM: dict = {
         "test_months": 12,
         "factor_report": "out/004c_c1_factors.json",
     },
+    "advice_card": {
+        "_comment": "产物形态（005S 降级）：radar_005s = 状态灯 + 避雷/观察名单，不做买入推荐。"
+                    "005R 旧卡与 004C 验证产物都是作废留档，本产物不得写到它们头上。",
+        "mode": "radar_005s",
+        "output": "out/005s_validation.json",
+        "legacy_outputs": ["out/advice_card.json", "out/004c_c2_validation.json"],
+    },
     "holdout": {
         "_comment": "holdout 段边界，冻结不许改（factors.DEV_END / HOLDOUT_START 同源）。",
         "start": "2025-11-07",
@@ -306,6 +313,22 @@ def validate(cfg: dict) -> None:
         raise ConfigError("system.validation.method 目前只实现 'rolling_24_12'，请使用该固定滚动口径")
     else:
         raise ConfigError(f"system.validation.method 未实现，当前 {method!r}")
+
+    # ---------- system.advice_card（005S 产物形态） ----------
+    card = system.get("advice_card") or {}
+    modes = {"radar_005s", "fallback_004c", "advice_card_005r"}
+    if card.get("mode") not in modes:
+        raise ConfigError(f"system.advice_card.mode 必须是 {sorted(modes)} 之一，"
+                          f"当前 {card.get('mode')!r}")
+    out = card.get("output")
+    if not isinstance(out, str) or not out.endswith(".json"):
+        raise ConfigError(f"system.advice_card.output 必须是 .json 路径，当前 {out!r}")
+    legacy = card.get("legacy_outputs") or []
+    if not isinstance(legacy, list) or any(not isinstance(x, str) for x in legacy):
+        raise ConfigError("system.advice_card.legacy_outputs 必须是字符串列表")
+    if out in legacy:
+        raise ConfigError(f"system.advice_card.output 不许指向作废留档 {out!r}"
+                          "（005R/004C 产物只读，覆盖等于毁掉审计追溯）")
 
     # ---------- veto / filters ----------
     veto = system.get("veto") or {}
