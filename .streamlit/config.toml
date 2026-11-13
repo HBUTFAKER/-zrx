@@ -1,0 +1,17 @@
+# Streamlit 运行配置（S4 雷达界面）
+# 只影响本地界面外观，不动任何研究/引擎配置。
+
+[theme]
+base = "dark"
+primaryColor = "#22c55e"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#161b22"
+textColor = "#e2e8f0"
+
+[server]
+# 本地单人使用，不开公网；headless 便于在终端起服务
+headless = true
+address = "127.0.0.1"
+
+[browser]
+gatherUsageStats = false
