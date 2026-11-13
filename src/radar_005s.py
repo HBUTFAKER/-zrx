@@ -25,13 +25,15 @@ import pandas as pd
 
 from src import config as C
 from src import metrics as M
-from src.advisor import ROOT, _git_meta, build_universe, trade_amount
+from src.advisor import ROOT, _git_meta, build_universe, load_names, trade_amount
 from src.factors import FACTOR_DEFS, month_end_indices
 
 #: 产物 schema。字段增删要往上加版本，别静默改结构。
 #: 005S-2：修 build_universe 用 T+1 涨停砍池的未来函数后重算全部统计，
 #: 并新增 monthly_lists 段（逐月名单代码落盘，供审计独立复核）。
-SCHEMA_VERSION = "005S-2"
+#: 005S-3：latest 段补 light_state（当日灯态快照 + 判定日期）与 watch_names
+#: （code→简称，来源 data/cache.db），施工B 不再按 JSON 自行重算灯态。
+SCHEMA_VERSION = "005S-3"
 #: 产物路径（与 005R 的 out/advice_card.json 分开，绝不覆盖旧卡留档）。
 OUT_NAME = "out/005s_validation.json"
 #: 逐月名单代码明细（005S-R2，供审计逐月复核）
@@ -87,6 +89,57 @@ def state_light(close: pd.Series, window: int = DD_WINDOW,
     """
     dd = rolling_drawdown(close, window)
     return (dd <= -(float(threshold) - 1e-12)).rename("defensive")
+
+
+def light_snapshot(light: pd.Series, dd: pd.Series, date: str,
+                   window: int = DD_WINDOW,
+                   threshold: float = DD_THRESHOLD) -> dict:
+    """单个交易日的灯态快照（005S-R3：施工B 直接读，不再自行重算）。
+
+    判定日期就是传入的 `date` —— 只用该日及以前的收盘价，`dd` 与 `light`
+    必须已经在**同一条**基准序列上算好（右对齐窗口，结构上看不到未来）。
+
+    缺数据时 `state=None` 并在 `note` 里写明，绝不默认成 "normal"：
+    把「没算出来」当成「正常期」等于凭空放宽。
+    """
+    lit = light.get(date)
+    d = dd.get(date)
+    if lit is None or d is None or not np.isfinite(float(d)):
+        return {"state": None, "as_of": str(date), "drawdown": None,
+                "window": int(window), "threshold": -float(threshold),
+                "note": "该交易日无基准收盘或缺前置窗口，未判定"}
+    return {"state": "defensive" if bool(lit) else "normal",
+            "as_of": str(date), "drawdown": _r(float(d)),
+            "window": int(window), "threshold": -float(threshold),
+            "rule": f"H00300 收盘相对过去 {int(window)} 日最高收盘回撤 ≤ "
+                    f"-{float(threshold):.0%} → defensive，否则 normal"}
+
+
+def names_for(codes: list[str], names: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """code → 简称映射；查不到的单独列出，不用「未知」之类占位符顶替。
+
+    名称只用于展示，不参与任何计算；`load_names` 取不到 cache.db 时返回空 dict，
+    于是 mapping 为空、missing 为全量 —— 仍是可解释的结果。
+    """
+    mapping = {c: names[c] for c in codes if names.get(c)}
+    missing = [c for c in codes if not names.get(c)]
+    return mapping, missing
+
+
+def latest_block(latest: dict, light: pd.Series, dd: pd.Series,
+                 names: dict[str, str]) -> dict:
+    """产物 latest 段：名单 + 同日灯态快照 + 名称映射（005S-R3 字段补全）。
+
+    单独抽出来是为了可测：这段是施工B 的唯一读取口，不能靠"跑一遍真实数据
+    看看有没有字段"来验证。
+    """
+    date = str(latest["date"])
+    mapping, missing = names_for(latest["watch_codes"], names)
+    return {"as_of": latest["date"], "universe": int(latest["n_universe"]),
+            "light_state": light_snapshot(light, dd, date),
+            "watch": latest["watch_codes"], "watch_names": mapping,
+            "watch_names_missing": missing,
+            "avoid": latest["avoid_codes"]}
 
 
 def month_flags(dates: list[str], light: pd.Series) -> dict[str, dict]:
@@ -311,6 +364,9 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
 
     latest_end = ends[-1]
     latest = rank_lists(fd, latest_end, system, mats, amount)
+    # 灯态快照与两份名单取**同一个截面日**，避免"名单是上周的、灯是今天的"。
+    latest_info = latest_block(latest, light, rolling_drawdown(bench, DD_WINDOW),
+                               load_names())
     return {
         "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "schema_version": SCHEMA_VERSION, **_git_meta(),
@@ -340,14 +396,17 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
         "watch": watch, "avoid": avoid,
         "months": month_log,
         "_monthly_lists": list_rows,
-        "latest": {"as_of": latest["date"], "universe": latest["n_universe"],
-                   "watch": latest["watch_codes"], "avoid": latest["avoid_codes"]},
+        "latest": latest_info,
         "product_note": PRODUCT_NOTE,
         "validity_note": [
             "只统计防守月；正常月的名单表现不构成建议，也不参与达标统计。",
             "名单月末出、次月持有，检验期不参与任何选择；不插补、不加权、不择时。",
             "持有期收益为零成本口径（雷达不交易），实际执行成本另计。",
-            "基准唯一：沪深300全收益 H00300。"],
+            "基准唯一：沪深300全收益 H00300。",
+            "latest.light_state 是最近截面日（as_of）当天的灯态，与两份名单同一截面；"
+            "state 为 null 表示该日无法判定，不默认成 normal。",
+            "latest.watch_names 来自 data/cache.db 的 stocks.code_name，只用于展示；"
+            "查不到的名称列在 watch_names_missing，不插补、不用占位符顶替。"],
     }
 
 

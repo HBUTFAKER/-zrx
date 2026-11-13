@@ -21,8 +21,8 @@ sys.path.insert(0, str(ROOT))
 
 import src.config as C  # noqa: E402
 from src.radar_005s import (AVOID_SPEC, WATCH_FACTORS, export_monthly_lists,  # noqa: E402
-                            month_flags, rolling_drawdown, score_lists, state_light,
-                            summarize)
+                            latest_block, light_snapshot, month_flags, names_for,
+                            rolling_drawdown, score_lists, state_light, summarize)
 
 
 # ---------------------------------------------------------------- 1. 无未来函数
@@ -197,3 +197,86 @@ def test_monthly_list_export_rejects_empty():
     """空输入也能落表（月份无名单时不炸），但行数为 0、不编造月份。"""
     meta = export_monthly_lists([], Path(__import__("tempfile").gettempdir()) / "empty_lists.parquet")
     assert meta["rows"] == 0 and meta["months"] == 0 and meta["first_month"] is None
+
+
+# ---------------------------------------------------------------- 6. latest 段契约（005S-R3）
+
+def test_light_snapshot_states_and_date():
+    """快照的 state 必须与阈值同口径，as_of 就是判定日。"""
+    idx = [f"2024-01-{i:02d}" for i in range(1, 32)]
+    down = pd.Series([100.0] * 30 + [85.0], index=idx)
+    snap = light_snapshot(state_light(down), rolling_drawdown(down), idx[-1])
+    assert snap["state"] == "defensive"
+    assert snap["as_of"] == "2024-01-31"
+    assert snap["threshold"] == -0.1 and snap["window"] == 20
+    assert snap["drawdown"] <= -0.1
+
+    mild = pd.Series([100.0] * 30 + [97.0], index=idx)
+    snap2 = light_snapshot(state_light(mild), rolling_drawdown(mild), idx[-1])
+    assert snap2["state"] == "normal" and snap2["drawdown"] == pytest.approx(-0.03)
+
+
+def test_light_snapshot_is_point_in_time():
+    """T 日快照只用 ≤T 的价格：污染 T 之后的价格，快照必须一模一样。"""
+    idx = [f"2024-02-{i:02d}" for i in range(1, 29)]
+    px = pd.Series(100.0 * np.cumprod(1.0 + np.sin(np.arange(28)) * 0.01), index=idx)
+    t = idx[20]
+    before = light_snapshot(state_light(px), rolling_drawdown(px), t)
+
+    polluted = px.copy()
+    polluted.iloc[21:] *= 0.3
+    after = light_snapshot(state_light(polluted), rolling_drawdown(polluted), t)
+    assert before == after
+
+
+def test_light_snapshot_missing_date_is_not_normal():
+    """缺数据 → state=None，不许默认成 normal（那等于凭空放宽验收线）。"""
+    idx = [f"2024-03-{i:02d}" for i in range(1, 11)]
+    px = pd.Series([100.0] * 10, index=idx)
+    snap = light_snapshot(state_light(px), rolling_drawdown(px), "2024-03-11")
+    assert snap["state"] is None and snap["drawdown"] is None
+    assert snap["as_of"] == "2024-03-11" and snap["note"]
+
+
+def test_names_for_keeps_missing_separate():
+    """名称映射只用真名；查不到的进 missing，不用占位符顶替。"""
+    codes = ["sh.600000", "sz.000001", "sh.600999"]
+    mapping, missing = names_for(codes, {"sh.600000": "浦发银行", "sz.000001": "平安银行"})
+    assert mapping == {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
+    assert missing == ["sh.600999"]
+    # cache.db 缺失时 load_names 返回空 dict：mapping 为空、missing 全量，仍可解释
+    empty_map, empty_missing = names_for(codes, {})
+    assert empty_map == {} and empty_missing == codes
+
+
+@pytest.mark.skipif(not (ROOT / "out" / "005s_validation.json").exists(),
+                    reason="产物尚未生成")
+def test_product_latest_block_contract():
+    """产物字段契约：施工B 直接读这两个字段，不许再自己重算。"""
+    import json
+    d = json.loads((ROOT / "out" / "005s_validation.json").read_text(encoding="utf-8"))
+    if d.get("schema_version") != "005S-3":
+        pytest.skip(f"磁盘上是旧产物 {d.get('schema_version')}，新字段等重出后再校验")
+    lt = d["latest"]
+    assert lt["light_state"]["state"] in ("defensive", "normal")
+    assert lt["light_state"]["as_of"] == lt["as_of"]
+    assert set(lt["watch_names"]).issubset(set(lt["watch"]))
+    assert set(lt["watch_names"]) | set(lt["watch_names_missing"]) == set(lt["watch"])
+    assert all(isinstance(v, str) and v for v in lt["watch_names"].values())
+
+
+def test_latest_block_assembles_light_and_names():
+    """latest 段组装：同日灯态 + 名称映射 + 未匹配清单，字段一个不少。"""
+    idx = [f"2024-04-{i:02d}" for i in range(1, 29)]
+    px = pd.Series([100.0] * 27 + [88.0], index=idx)
+    latest = {"date": idx[-1], "n_universe": 2100,
+              "watch_codes": ["sh.600000", "sz.000001", "sh.600999"],
+              "avoid_codes": ["sh.600001"]}
+    blk = latest_block(latest, state_light(px), rolling_drawdown(px),
+                       {"sh.600000": "浦发银行", "sz.000001": "平安银行"})
+    assert blk["as_of"] == "2024-04-28" and blk["universe"] == 2100
+    assert blk["light_state"]["state"] == "defensive"
+    assert blk["light_state"]["as_of"] == blk["as_of"]
+    assert blk["watch"] == latest["watch_codes"] and blk["avoid"] == ["sh.600001"]
+    assert blk["watch_names"] == {"sh.600000": "浦发银行", "sz.000001": "平安银行"}
+    assert blk["watch_names_missing"] == ["sh.600999"]
