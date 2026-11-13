@@ -276,11 +276,13 @@ def build_universe(fd, i: int, system: dict, mats: dict[str, np.ndarray],
     steps["dropped_liquidity"] = int(base.sum() - liq.sum())
 
     if flt.get("exclude_limit_up", True):
-        # blocked_buy = 开盘即涨停（买不进）。同时排除**次日**开盘涨停的票：
-        # 卡是 T 日收盘出、T+1 开盘买，次日一字板根本成交不了。
+        # 只用 T 日（名单形成日/截面日）收盘前可得的信息：T 日开盘即涨停的买不进，
+        # 当日就该从池里剔掉。
+        # 005S-R2 整改（审计C B8-B）：此处原先还 `lu |= liq & blocked_buy[i+1]`，
+        # 用持有期首日（T+1）开盘的一字板来砍 T 日的池 —— 拿明天的盘面筛今天的名单，
+        # 属未来函数。已删除。T+1 到底买不买得进，由回测执行层在成交日自己判断
+        # （backtest.run_backtest 里的 blocked_buy 分支），不靠截面预先剔除。
         lu = liq & fd.panel.blocked_buy[i]
-        if i + 1 < len(fd.dates):
-            lu |= liq & fd.panel.blocked_buy[i + 1]
         liq = liq & ~lu
         steps["dropped_limit_up"] = int(lu.sum())
     else:
@@ -594,7 +596,7 @@ def analyze_004c(fd, cfg: dict, *, verbose: bool = False) -> dict:
     reasons = gates["fallback_reason"]
     report = {
         "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
-        "schema_version": "004C-1", **_git_meta(), "verdict": verdict,
+        "schema_version": "004C-2", **_git_meta(), "verdict": verdict,
         "fallback_reason": reasons,
         "validation": {k: v for k, v in rolling.items() if not k.startswith("_")},
         "gates": gates,
@@ -1179,6 +1181,14 @@ def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
         direction = None if not dev_pass or ho_ex is None else (
             float(dev_ex) == 0 or float(ho_ex) == 0 or
             ((float(dev_ex) > 0) == (float(ho_ex) > 0)))
+        # 005S-R2：旧契约也返回数组，形状与 004C 一致（顺序即影响度）。
+        legacy_reasons = []
+        if not dev_pass:
+            legacy_reasons.append("dev")
+        if not dd_pass:
+            legacy_reasons.append("periods")
+        if direction is False:
+            legacy_reasons.append("direction")
         return {"dev": {"pass": bool(dev_pass), "excess": dev_ex, "threshold": thr,
                         "strategy_ann": (dev.get("strategy") or {}).get("ann_return"),
                         "bench_ann": (dev.get("bench") or {}).get("ann_return")},
@@ -1189,18 +1199,19 @@ def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
                             "bench_ann": (holdout.get("bench") or {}).get("ann_return") if holdout else None,
                             "strategy_mdd": (holdout.get("strategy") or {}).get("mdd") if holdout else None,
                             "bench_mdd": (holdout.get("bench") or {}).get("mdd") if holdout else None,
-                            "checked": bool(dev_pass)}, 
+                            "checked": bool(dev_pass)},
+                "fallback_reason": legacy_reasons or None,
                 "both_pass": bool(dev_pass and dd_pass and direction is not False)}
     if rolling is None:
         # 005R历史产物回归只允许拒绝，不把旧口径误读成004C证据。
+        # 005S-R2：各分支统一返回数组，不留单值路径（下游不必判类型）。
         return {"forced": {"pass": not forced, "reason": "forced" if forced else None},
                 "drawdown": {"pass": False, "mdd": None, "threshold": float(g.get("max_portfolio_mdd", 0.15)),
                              "reason": "missing_rolling_evidence"},
                 "stability": {"pass": False, "mean_excess": None,
                               "positive_windows": 0, "window_count": 0,
                               "reason": "missing_rolling_evidence"},
-                # 005R 兼容分支：旧产物回归只看旧单值口径，不随 004C 数组化改动。
-                "fallback_reason": "forced" if forced else "stability",
+                "fallback_reason": ["forced"] if forced else ["stability"],
                 "both_pass": False}
 
     rows = rolling.get("windows") or []
@@ -1637,9 +1648,10 @@ def analyze(fd, cfg: dict, *, verbose: bool = False) -> dict:
                            f"方向相反（{gates['holdout']['direction_note']}）")
         fallback = {
             "message": "本次不建议",
-            "fallback_reason": ("forced" if pick["forced"] else
-                               "drawdown" if not gates["periods"]["pass"] else
-                               "stability"),
+            # 005S-R2：旧流程产物同一形状（数组），不留单值路径。
+            "fallback_reason": (["forced"] if pick["forced"] else
+                               ["drawdown"] if not gates["periods"]["pass"] else
+                               ["stability"]),
             "band": band,
             "reasons": reasons,
             "numbers": {

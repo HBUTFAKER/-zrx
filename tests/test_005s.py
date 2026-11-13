@@ -20,8 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import src.config as C  # noqa: E402
-from src.radar_005s import (AVOID_SPEC, WATCH_FACTORS, month_flags,  # noqa: E402
-                            rolling_drawdown, score_lists, state_light, summarize)
+from src.radar_005s import (AVOID_SPEC, WATCH_FACTORS, export_monthly_lists,  # noqa: E402
+                            month_flags, rolling_drawdown, score_lists, state_light,
+                            summarize)
 
 
 # ---------------------------------------------------------------- 1. 无未来函数
@@ -167,3 +168,32 @@ def test_default_advice_card_mode_is_radar():
     assert s["mode"] == "radar_005s"
     assert s["output"] == "out/005s_validation.json"
     assert "out/advice_card.json" in s["legacy_outputs"]
+
+
+# ---------------------------------------------------------------- 6. 逐月名单明细（005S-R2）
+
+def test_export_monthly_lists_long_table(tmp_path):
+    """名单明细长表：一票一行、字段齐、名次连续、不含任何已算好的收益列。"""
+    rows = [{"month": "2024-01", "formed_at": "2024-01-31", "list_type": "watch",
+             "rank": 1, "code": "000001.SZ", "n_universe": 1800},
+            {"month": "2024-01", "formed_at": "2024-01-31", "list_type": "watch",
+             "rank": 2, "code": "000002.SZ", "n_universe": 1800},
+            {"month": "2024-01", "formed_at": "2024-01-31", "list_type": "avoid",
+             "rank": 1, "code": "600000.SH", "n_universe": 1800}]
+    path = tmp_path / "lists.parquet"
+    meta = export_monthly_lists(rows, path)
+
+    back = pd.read_parquet(path)
+    assert list(back.columns) == ["month", "formed_at", "list_type", "rank", "code", "n_universe"]
+    assert len(back) == 3 and meta["rows"] == 3
+    assert meta["months"] == 1 and meta["first_month"] == meta["last_month"] == "2024-01"
+    assert meta["rows_by_type"] == {"avoid": 1, "watch": 2}
+    # 明细里不许夹带收益字段 —— 审计要拿原始名单自己算
+    assert not {"excess", "strategy_ret", "bench_ret"} & set(back.columns)
+    assert back.loc[back["list_type"] == "watch", "rank"].tolist() == [1, 2]
+
+
+def test_monthly_list_export_rejects_empty():
+    """空输入也能落表（月份无名单时不炸），但行数为 0、不编造月份。"""
+    meta = export_monthly_lists([], Path(__import__("tempfile").gettempdir()) / "empty_lists.parquet")
+    assert meta["rows"] == 0 and meta["months"] == 0 and meta["first_month"] is None

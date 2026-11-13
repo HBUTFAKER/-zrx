@@ -466,8 +466,35 @@ def test_004c_rejects_005r_legacy_evidence():
                             old.get("validation", {}),
                             old.get("segments", {}).get("holdout", {}), sysd)
     assert result["both_pass"] is False
-    assert result["fallback_reason"] in {"forced", "stability"}
+    # 005S-R2：只测「被拦 + reason 是数组且含预期闸」，不锁死具体形状
+    assert isinstance(result["fallback_reason"], list)
+    assert "stability" in result["fallback_reason"]
     assert result["drawdown"]["reason"] == "missing_rolling_evidence"
+
+
+def test_legacy_yearly_freeze_reason_is_array():
+    """005S-R2：旧 yearly_freeze 分支也返回数组，全仓库不留单值路径。"""
+    sysd = _sys(C.default_config())
+    sysd["validation"] = dict(sysd["validation"], method="yearly_freeze")
+    dev_bad = {"excess": -0.02, "strategy": {"ann_return": 0.0},
+               "bench": {"ann_return": 0.02}}
+    holdout = {"excess": 0.03, "strategy": {"ann_return": 0.05, "mdd": -0.10},
+               "bench": {"ann_return": 0.02, "mdd": -0.10}}
+
+    bad = evaluate_gates(dev_bad, {"rows": []}, holdout, sysd)
+    assert bad["fallback_reason"] == ["dev", "periods"]
+    assert bad["both_pass"] is False
+
+    dev_ok = {"excess": 0.02, "strategy": {"ann_return": 0.05},
+              "bench": {"ann_return": 0.03}}
+    rows = [{"period": "2022", "dd_ok": True, "dd_worse_pp": 0.0,
+             "strategy_mdd": -0.10, "pool_mdd": -0.12, "excess": 0.01}]
+    passed = evaluate_gates(dev_ok, {"rows": rows}, holdout, sysd)
+    assert passed["both_pass"] is True
+    assert passed["fallback_reason"] is None
+    # 只挂方向一条：数组仍是数组，长度 1
+    flipped = evaluate_gates(dev_ok, {"rows": rows}, dict(holdout, excess=-0.02), sysd)
+    assert flipped["fallback_reason"] == ["direction"]
 
 
 def test_004c_gates_require_forced_drawdown_and_stability():
@@ -762,8 +789,28 @@ def test_filters_liquidity_st_listed_and_limit_up(cfg):
     assert lu["steps"]["dropped_limit_up"] >= 1
 
     fd.panel.blocked_buy[i, 4] = False
-    fd.panel.blocked_buy[i + 1, 5] = True       # 次日一字板：卡上出得来也买不进
-    assert not build_universe(fd, i, sysd, mats, amt)["mask"][5]
+    fd.panel.blocked_buy[i + 1, 5] = True
+    # 005S-R2：T+1 一字板不参与 T 日筛池 —— 拿明天的盘面筛今天的名单是未来函数。
+    # 买不买得进由回测执行层在成交日判断，截面层不许预先剔除。
+    assert build_universe(fd, i, sysd, mats, amt)["mask"][5]
+
+
+def test_universe_ignores_next_day_limit_up(cfg):
+    """005S-R2 回归（审计C B8-B）：截面池对 T+1 涨停必须完全免疫。"""
+    fd = make_fd(trap_up=True, months=13)
+    mats, amt = _mats(fd)
+    sysd = _sys(cfg)
+    i = 23
+    base = build_universe(fd, i, sysd, mats, amt)["mask"].copy()
+    assert base.any(), "构造失效：池子本来就空，去掉 T+1 也不会变"
+
+    fd.panel.blocked_buy[i + 1, :] = True        # 次日全市场一字板
+    after = build_universe(fd, i, sysd, mats, amt)["mask"]
+    assert np.array_equal(base, after), "T+1 涨停影响了 T 日池子，未来函数回来了"
+
+    # 反向对照：T 日自己的涨停必须剔，否则上面那条断言等于空转
+    fd.panel.blocked_buy[i, 4] = True
+    assert not build_universe(fd, i, sysd, mats, amt)["mask"][4]
 
 
 # ================================================================ 10. 段切分与信号边界

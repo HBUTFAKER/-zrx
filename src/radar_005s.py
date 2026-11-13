@@ -29,9 +29,13 @@ from src.advisor import ROOT, _git_meta, build_universe, trade_amount
 from src.factors import FACTOR_DEFS, month_end_indices
 
 #: 产物 schema。字段增删要往上加版本，别静默改结构。
-SCHEMA_VERSION = "005S-1"
+#: 005S-2：修 build_universe 用 T+1 涨停砍池的未来函数后重算全部统计，
+#: 并新增 monthly_lists 段（逐月名单代码落盘，供审计独立复核）。
+SCHEMA_VERSION = "005S-2"
 #: 产物路径（与 005R 的 out/advice_card.json 分开，绝不覆盖旧卡留档）。
 OUT_NAME = "out/005s_validation.json"
+#: 逐月名单代码明细（005S-R2，供审计逐月复核）
+LISTS_NAME = "005s_monthly_lists.parquet"
 #: 基准：沪深300全收益（与 004C 同一份，禁双基准）。
 BENCH_PATH = "data/raw/index/hs300_total_return_2026-11-09.parquet"
 #: 灯的固定参数（验收规格 §二，不许在运行时改）
@@ -52,7 +56,7 @@ AVOID_SPEC = (("lowvol_20", -1.0, 0.4),     # 波动高（lowvol 分位低）
 #: 产品文案里必须原样出现的限制（指令 §一）
 PRODUCT_NOTE = (
     "这只雷达只在防守期有价值：2021~2023 三个熊市检验年，低波动组合对沪深300全收益"
-    "分别跑出 +15.0 / +5.9 / +7.4pp 超额，且回撤年年更浅；2024、2025 反弹行情跑输。"
+    "分别跑出 +14.9 / +5.8 / +7.4pp 超额，且回撤年年更浅；2024、2025 反弹行情跑输。"
     "正常期不给建议，只报状态灯。")
 
 
@@ -262,6 +266,7 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
     watch_rows: list[dict] = []
     avoid_rows: list[dict] = []
     month_log: list[dict] = []
+    list_rows: list[dict] = []
     for a, b in zip(ends, ends[1:]):
         ym_form, ym_hold = dates[a][:7], dates[b][:7]
         if ym_hold[:4] not in years:
@@ -269,6 +274,14 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
         flag = flags.get(ym_hold) or {}
         defensive = bool(flag.get("defensive"))
         lists = rank_lists(fd, a, system, mats, amount)
+        # 逐月名单代码明细（不只防守月）：审计要能按自己的一套判定复核，
+        # 所以正常月的名单也必须留档，不能只交统计结果。
+        for kind, cols in (("watch", lists["watch"]), ("avoid", lists["avoid"])):
+            for rk, col in enumerate(cols, start=1):
+                list_rows.append({"month": ym_hold, "formed_at": dates[a],
+                                  "list_type": kind, "rank": rk,
+                                  "code": fd.codes[col],
+                                  "n_universe": lists["n_universe"]})
         w = month_result(fd, lists["watch"], a, b, bench)
         v = month_result(fd, lists["avoid"], a, b, bench)
         row = {"month": ym_hold, "formed_at": dates[a], "defensive": defensive,
@@ -326,6 +339,7 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
         },
         "watch": watch, "avoid": avoid,
         "months": month_log,
+        "_monthly_lists": list_rows,
         "latest": {"as_of": latest["date"], "universe": latest["n_universe"],
                    "watch": latest["watch_codes"], "avoid": latest["avoid_codes"]},
         "product_note": PRODUCT_NOTE,
@@ -335,6 +349,30 @@ def validate(fd, cfg: dict, *, verbose: bool = False) -> dict:
             "持有期收益为零成本口径（雷达不交易），实际执行成本另计。",
             "基准唯一：沪深300全收益 H00300。"],
     }
+
+
+def export_monthly_lists(rows: list[dict], path: Path) -> dict:
+    """逐月两张名单的代码明细落盘（长表：一行一只票）。
+
+    审计C 要能不复用我们的月度统计、自己按名单重算。所以这里给的是**原始名单**：
+    月份、形成日、名单类型、名次、代码、当月可投池只数 —— 不含任何已算好的收益。
+    """
+    cols = ["month", "formed_at", "list_type", "rank", "code", "n_universe"]
+    frame = pd.DataFrame(rows, columns=cols)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+    back = pd.read_parquet(path)
+    if len(back) != len(frame):
+        raise RuntimeError(f"名单落盘后行数不符：写 {len(frame)} 行、读回 {len(back)} 行")
+    counts = back.groupby("list_type").size().to_dict() if len(back) else {}
+    return {"path": path.name, "rows": int(len(frame)), "columns": cols,
+            "months": int(back["month"].nunique()) if len(back) else 0,
+            "first_month": str(back["month"].min()) if len(back) else None,
+            "last_month": str(back["month"].max()) if len(back) else None,
+            "rows_by_type": {k: int(v) for k, v in counts.items()},
+            "note": "长表：month=持有月，formed_at=名单形成日（月末收盘），list_type=watch/avoid，"
+                    "rank=按分数降序的名次，n_universe=当月可投池只数。不含收益字段，"
+                    "审计可自行取价复核。"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -354,8 +392,11 @@ def main(argv: list[str] | None = None) -> int:
     if not p.is_absolute():
         p = ROOT / p
     p.parent.mkdir(parents=True, exist_ok=True)
+    rep["monthly_lists"] = export_monthly_lists(
+        rep.pop("_monthly_lists", []), p.parent / LISTS_NAME)
     p.write_text(json.dumps(rep, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"产物：{p}")
+    print(f"名单明细：{p.parent / LISTS_NAME}（{rep['monthly_lists']['rows']} 行）")
     print(f"防守月 {rep['light']['n_defensive_months']}/{rep['light']['n_months']}；"
           f"观察达标 {rep['watch']['n_qualified']}/{rep['watch']['n_months']}"
           f"（{rep['watch']['pass_rate']}）；"

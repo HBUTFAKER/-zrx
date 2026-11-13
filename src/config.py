@@ -64,7 +64,8 @@ DEFAULT_SYSTEM: dict = {
                               "平均保留 61.7% 的截面样本；1 亿只保留 40.9%，会把小盘股整体切掉。",
         "min_listed_days": 60,
         "exclude_limit_up": True,
-        "exclude_limit_up_comment": "截面日或次日开盘涨停的票不可选（次日买不进）。",
+        "exclude_limit_up_comment": "只剔截面日（T 日）开盘涨停的票。T+1 是否买得进由"
+                                    "回测执行层判断，不许拿 T+1 盘面参加 T 日筛选（未来函数）。",
     },
     "portfolio": {
         "_comment": "持仓形态：综合分前 band 比例的全部股票等权持有（005R 业主拍板）。"

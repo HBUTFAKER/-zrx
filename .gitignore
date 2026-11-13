@@ -3,6 +3,8 @@ data/*
 out/*
 # 例外：审计证据类产物必须版本化（004C 日净值，供独立复算 MDD）
 !out/004c_daily_nav.parquet
+# 例外：005S 逐月名单代码，供审计独立复核（005S-R2 警告-2）
+!out/005s_monthly_lists.parquet
 # 例外：字段字典是文档不是数据，必须进版本库
 !data/dict.md
 

@@ -331,18 +331,26 @@ def print_summary(rep: dict) -> str:
 
 
 def _git_meta() -> dict:
-    """代码溯源：沿用 advisor/factors 口径（code_dirty 只看 src/ tests/）。"""
+    """代码溯源：与 advisor._git_meta 同口径。
+
+    code_commit 取**完整** 40 位哈希（R2 补充条款：内嵌值必须与 HEAD 逐字一致，
+    短哈希对不上）；code_dirty 只看 src/ tests/，产物目录变化不算代码脏。
+    """
     import subprocess
     try:
-        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=ROOT,
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT,
                                 capture_output=True, text=True, timeout=10
                                 ).stdout.strip()
-        st = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
+        st = subprocess.run(["git", "-c", "core.quotepath=false", "status",
+                             "--porcelain"], cwd=ROOT,
                             capture_output=True, text=True, timeout=10).stdout
-        code = [ln[3:] for ln in st.splitlines()
-                if ln[3:].startswith(("src/", "tests/"))]
+        paths = [ln[3:].strip().strip('"') for ln in st.splitlines() if ln.strip()]
+        code = [p for p in paths if p.startswith(("src/", "tests/"))]
         return {"code_commit": commit or "unknown", "code_dirty": bool(code),
-                "code_dirty_files": code[:20]}
+                "code_dirty_files": code[:20],
+                "worktree_dirty": bool(paths),
+                "worktree_other_files": [p for p in paths
+                                         if not p.startswith(("src/", "tests/"))][:20]}
     except Exception:  # noqa: BLE001
         return {"code_commit": "unknown", "code_dirty": None, "code_dirty_files": []}
 
