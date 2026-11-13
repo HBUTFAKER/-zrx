@@ -18,12 +18,13 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import src.config as C
 from src.advisor import (_rebalance_block, _seg_window, analyze, band_neighbors,
                          budget_plan, build_card, build_signals, build_universe,
-                         composite_scores, evaluate_gates, factor_mats,
+                         composite_scores, evaluate_gates, export_daily_nav, factor_mats,
                          pool_equal_weight, run_segment, scan_bands, score_cross_sections,
                          select_band, select_top_k, side_band_signals,
                          signals_from_cache, trade_amount, yearly_validation)
@@ -485,11 +486,75 @@ def test_004c_gates_require_forced_drawdown_and_stability():
         bad = dict(good, **{field: value})
         result = evaluate_gates({}, {}, None, sysd, rolling=bad)
         assert result["both_pass"] is False
-        assert result["fallback_reason"] == reason
+        assert result["fallback_reason"] == [reason]
 
     forced = evaluate_gates({}, {}, None, sysd, forced=True, rolling=good)
     assert forced["both_pass"] is False
-    assert forced["fallback_reason"] == "forced"
+    assert forced["fallback_reason"] == ["forced"]
+
+
+def test_004c_fallback_reason_lists_all_triggered_gates():
+    """005S-R1：三闸全挂必须全列，顺序 fixed(forced>drawdown>stability)，不许被 forced 遮蔽。"""
+    sysd = _sys(C.default_config())
+    bad = {"windows": [{"excess": -0.01}] * 5, "mean_excess": 0.001,
+           "positive_windows": 2, "window_count": 5, "portfolio_mdd": -0.30}
+    triple = evaluate_gates({}, {}, None, sysd, forced=True, rolling=bad)
+    assert triple["fallback_reason"] == ["forced", "drawdown", "stability"]
+    assert triple["both_pass"] is False
+
+    # 无 forced 时只列真实失败的两闸，顺序不变
+    two = evaluate_gates({}, {}, None, sysd, forced=False, rolling=bad)
+    assert two["fallback_reason"] == ["drawdown", "stability"]
+
+    # 只挂稳定性一闸：数组仍是数组（长度 1），下游不必判类型
+    only_stability = evaluate_gates(
+        {}, {}, None, sysd, forced=False,
+        rolling=dict(bad, portfolio_mdd=-0.10, mean_excess=0.03,
+                     positive_windows=3))
+    assert only_stability["fallback_reason"] == ["stability"]
+
+
+def test_004c_fallback_notes_cover_every_failed_gate():
+    """005S-R1：fallback.reasons 必须逐闸出句子，不许只剩一句"门槛未通过"。"""
+    from src.advisor import _004c_gate_failure_notes
+    sysd = _sys(C.default_config())
+    bad = {"windows": [{"excess": -0.01}] * 5, "mean_excess": 0.001,
+           "positive_windows": 2, "window_count": 5, "portfolio_mdd": -0.30}
+    gates = evaluate_gates({}, {}, None, sysd, forced=True, rolling=bad)
+    rolling = {"band_selection": {"selected": 0.30},
+               "portfolio_mdd_peak": "2021-12-16", "portfolio_mdd_trough": "2024-02-05"}
+    notes = _004c_gate_failure_notes(gates, rolling)
+
+    assert len(notes) == len(gates["fallback_reason"]) == 3
+    assert [n.split("：")[0] for n in notes] == ["forced", "drawdown", "stability"]
+    assert "-30.00%" in notes[1] and "-15%" in notes[1]
+    assert "1/5" not in notes[2] and "2/5" in notes[2]
+    # forced 那句话必须自带免责，避免被读成"只是选档问题"
+    assert "不代表另两闸通过" in notes[0]
+
+
+def test_004c_daily_nav_export_columns_order_and_mdd(tmp_path):
+    """005S-R1：导出的 parquet 三列齐、日期升序、nav 列独立重算 MDD 与引擎一致。"""
+    dates = pd.bdate_range("2021-01-04", periods=40)
+    nav = np.concatenate([np.linspace(1.0, 1.2, 20), np.linspace(1.2, 0.9, 20)])
+    bench = np.linspace(1.0, 1.05, 40)
+    frame = pd.DataFrame({"date": dates, "nav": nav, "benchmark_nav": bench,
+                          "junk": 0.0})
+    path = tmp_path / "004c_daily_nav.parquet"
+    # 故意倒序传入：导出必须自己排序，不许依赖上游顺序
+    meta = export_daily_nav(frame.iloc[::-1], path)
+
+    assert path.exists()
+    back = pd.read_parquet(path)
+    assert list(back.columns) == ["date", "nav", "benchmark_nav"]
+    assert meta["columns"] == ["date", "nav", "benchmark_nav"]
+    assert meta["rows"] == 40 == len(back)
+    assert back["date"].is_monotonic_increasing
+    assert meta["start"] == "2021-01-04"
+    assert back["nav"].iloc[0] == pytest.approx(1.0)
+    # 1.2 → 0.9 是 -25%，独立重算必须复现，否则审计对不上
+    assert meta["mdd_recomputed"] == pytest.approx(-0.25, abs=1e-6)
+    assert meta["benchmark_last"] == pytest.approx(float(bench[-1]))
 
 
 def test_004c_composite_is_simple_equal_weight_of_selected_factors(cfg):

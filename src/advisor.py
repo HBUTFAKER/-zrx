@@ -66,6 +66,8 @@ ROOT = Path(__file__).resolve().parent.parent
 CACHE_DB = ROOT / "data" / "cache.db"
 OUT_DIR = ROOT / "out"
 CARD_NAME = "advice_card.json"
+#: 004C 全段组合日净值导出（供审计独立逐日复算 MDD，005S-R1 B8-A）
+DAILY_NAV_NAME = "004c_daily_nav.parquet"
 
 #: 产物 schema 版本。字段有增删就往上加，别静默改结构（下游脚本要吃这个文件）。
 SCHEMA_VERSION = "005R-1"
@@ -502,6 +504,13 @@ def rolling_validation(fd, system: dict, mats: dict[str, np.ndarray],
     if benchmark_series.isna().any():
         raise RuntimeError("H00300 基准净值缺少滚动检验交易日")
     mdd = _nav_metrics(strat_series)["mdd"]
+    # 005S-R1：把串接后的全段日净值带出去，供 analyze_004c 落盘给审计逐日复算。
+    # 矩阵只做形状转换，不参与任何指标计算，回测结果与加导出前逐位相同。
+    daily_nav = pd.DataFrame({
+        "date": pd.to_datetime([str(d) for d in strat_series.index]),
+        "nav": strat_series.to_numpy(dtype="float64"),
+        "benchmark_nav": benchmark_series.to_numpy(dtype="float64"),
+    })
     rolling = {"method": "rolling_24_12", "benchmark": "H00300",
                "benchmark_path": "data/raw/index/hs300_total_return_2026-11-09.parquet",
                "band_selection": {"fit_end": "2020-12-31", "factors": w1_factors,
@@ -512,8 +521,63 @@ def rolling_validation(fd, system: dict, mats: dict[str, np.ndarray],
                "positive_windows": positive, "window_count": len(rows),
                "portfolio_mdd": mdd, "portfolio_mdd_peak": M.max_drawdown(strat_series)["peak"],
                "portfolio_mdd_trough": M.max_drawdown(strat_series)["trough"],
-               "_portfolios": portfolios}
+               "_portfolios": portfolios, "_daily_nav": daily_nav}
     return rolling
+
+
+def export_daily_nav(frame: pd.DataFrame, path: Path) -> dict:
+    """落盘 004C 全段组合日净值（date / nav / benchmark_nav）。
+
+    只做导出：nav 是回测引擎串接后的原始净值，不做任何缩放或补点。
+    审计方据此可独立复算 MDD —— 若与 portfolio_mdd 不一致，说明一方算错。
+    """
+    frame = frame[["date", "nav", "benchmark_nav"]].sort_values("date").reset_index(drop=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_parquet(path, index=False)
+    back = pd.read_parquet(path)
+    if len(back) != len(frame):
+        raise RuntimeError(f"日净值导出后行数不符：写 {len(frame)} 行、读回 {len(back)} 行")
+    series = pd.Series(back["nav"].to_numpy(dtype="float64"))
+    mdd = _nav_metrics(series)["mdd"]
+    shown = path.resolve().relative_to(ROOT).as_posix() if path.resolve().is_relative_to(ROOT) else path.as_posix()
+    return {"path": shown,
+            "rows": int(len(frame)),
+            "start": str(back["date"].iloc[0].date()),
+            "end": str(back["date"].iloc[-1].date()),
+            "nav_last": _r(float(back["nav"].iloc[-1])),
+            "benchmark_last": _r(float(back["benchmark_nav"].iloc[-1])),
+            "mdd_recomputed": _r(mdd),
+            "columns": ["date", "nav", "benchmark_nav"],
+            "note": "nav 为五个滚动检验年度串接后的组合净值（未缩放、未补点）；"
+                    "mdd_recomputed 由本文件 nav 列独立重算，应与 validation.portfolio_mdd 相等。"}
+
+
+def _004c_gate_failure_notes(gates: dict, rolling: dict) -> list[str]:
+    """把每一个触发的闸翻成一句带数字的人话，顺序与 fallback_reason 数组一致。
+
+    005S-R1 要点：以前只看 fallback_reason 单值，forced 一遮就看不到回撤和稳定性
+    也在破线；这里逐闸独立生成，谁也不吞谁。
+    """
+    notes: list[str] = []
+    band = (rolling.get("band_selection") or {}).get("selected")
+    if gates["forced"]["pass"] is False:
+        notes.append(
+            f"forced：定档段（截止 2020-12-31）没有合格档位，band {_f(band, '.0%')} 为强制取值"
+            f" —— 选档本身无证据支持；此项只说明选档问题，不代表另两闸通过")
+    dd = gates["drawdown"]
+    if dd["pass"] is False:
+        notes.append(
+            f"drawdown：全段组合最大回撤 {_f(dd['mdd'], '.2%')}"
+            f"（峰值 {rolling.get('portfolio_mdd_peak')} → 谷值 {rolling.get('portfolio_mdd_trough')}），"
+            f"超过绝对阈值 -{_f(dd['threshold'], '.0%')}")
+    st = gates["stability"]
+    if st["pass"] is False:
+        notes.append(
+            f"stability：五年平均超额 {_f(st['mean_excess'], '+.2%')}"
+            f"（要求 ≥ {_f(st['mean_threshold'], '.0%')}），正窗口 "
+            f"{st['positive_windows']}/{st['window_count']}"
+            f"（要求 ≥ {st['positive_threshold']}）")
+    return notes
 
 
 def analyze_004c(fd, cfg: dict, *, verbose: bool = False) -> dict:
@@ -522,26 +586,32 @@ def analyze_004c(fd, cfg: dict, *, verbose: bool = False) -> dict:
     mats = rolling_factor_mats(fd)
     amount = trade_amount(fd)
     rolling = rolling_validation(fd, system, mats, amount, verbose=verbose)
+    # 日净值是交付物，不是研究中间量：落盘后才能被审计独立复算 MDD。
+    nav_meta = export_daily_nav(rolling.pop("_daily_nav"), OUT_DIR / DAILY_NAV_NAME)
     forced = bool(rolling.get("band_selection_forced"))
     gates = evaluate_gates({}, {}, None, system, forced=forced, rolling=rolling)
     verdict = "advise" if gates["both_pass"] else "fallback"
-    reason = gates["fallback_reason"]
+    reasons = gates["fallback_reason"]
     report = {
         "generated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
         "schema_version": "004C-1", **_git_meta(), "verdict": verdict,
-        "fallback_reason": reason,
+        "fallback_reason": reasons,
         "validation": {k: v for k, v in rolling.items() if not k.startswith("_")},
         "gates": gates,
+        "daily_nav": nav_meta,
         "fallback": (None if verdict == "advise" else {
-            "message": "不可作投资建议引用", "fallback_reason": reason,
-            "reasons": [f"004C 策略准入闸未通过：{reason}"],
+            "message": "不可作投资建议引用", "fallback_reason": reasons,
+            "reasons": _004c_gate_failure_notes(gates, rolling),
             "research_conclusion": "因子研究与滚动窗口结果保留，不因 fallback 丢弃。"}),
         "card": None,
         "validity_note": [
             "验证基准为沪深300全收益指数 H00300。",
             "窗口级回撤仅记录；策略准入回撤为五个滚动检验年度串接后的组合最大回撤。",
             "全段最大回撤由最深年份主导，不是五年逐年回撤考核。",
-            "窗口因子与反转主窗均由对应训练段冻结，检验段只评估。"],
+            "窗口因子与反转主窗均由对应训练段冻结，检验段只评估。",
+            "fallback_reason 为数组，按影响度列出全部触发闸（forced > drawdown > stability）："
+            "forced 只表示定档段无合格档位，不等于其余两闸通过。",
+            "daily_nav 为串接后的逐日净值，其 nav 列独立重算的 MDD 应与 portfolio_mdd 一致。"],
     }
     return report
 
@@ -1129,6 +1199,7 @@ def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
                 "stability": {"pass": False, "mean_excess": None,
                               "positive_windows": 0, "window_count": 0,
                               "reason": "missing_rolling_evidence"},
+                # 005R 兼容分支：旧产物回归只看旧单值口径，不随 004C 数组化改动。
                 "fallback_reason": "forced" if forced else "stability",
                 "both_pass": False}
 
@@ -1144,10 +1215,18 @@ def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
     drawdown_pass = mdd is not None and abs(float(mdd)) <= dd_limit + 1e-12
     stability_pass = (mean_excess is not None and float(mean_excess) >= mean_limit
                       and count == 5 and positive >= positive_limit)
-    reason = ("forced" if not forced_pass else
-              "drawdown" if not drawdown_pass else
-              "stability" if not stability_pass else None)
-    rolling["fallback_reason"] = reason
+    # 005S-R1：fallback_reason 由单值改数组，列出**全部**触发闸，不再被 forced 遮蔽。
+    # 排序即影响度：forced（策略不可用级，选档无证据）> drawdown（绝对回撤破线，
+    # 是资金安全级）> stability（滚动不稳定，是证据强度级）。顺序固定，审计可预期。
+    reasons = []
+    if not forced_pass:
+        reasons.append("forced")
+    if not drawdown_pass:
+        reasons.append("drawdown")
+    if not stability_pass:
+        reasons.append("stability")
+    fallback_reasons = reasons or None
+    rolling["fallback_reason"] = fallback_reasons
     return {"forced": {"pass": forced_pass, "reason": "forced" if forced else None},
             "drawdown": {"pass": bool(drawdown_pass), "mdd": mdd,
                           "threshold": dd_limit, "scope": "rolling_full_period"},
@@ -1162,7 +1241,7 @@ def evaluate_gates(dev: dict, yearly: dict, holdout: dict | None,
             "holdout": {"strategy_ann": None, "bench_ann": None, "excess": None,
                         "strategy_mdd": None, "bench_mdd": None,
                         "direction_consistent": None, "checked": False},
-            "fallback_reason": reason,
+            "fallback_reason": fallback_reasons,
             "both_pass": bool(forced_pass and drawdown_pass and stability_pass)}
 
 
